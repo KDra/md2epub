@@ -10,6 +10,7 @@ pub mod ctx;
 pub mod dom;
 pub mod epub;
 pub mod html;
+pub mod linked;
 pub mod markdown;
 pub mod math;
 pub mod mermaid;

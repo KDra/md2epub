@@ -28,7 +28,9 @@
 //!   files (`other.md#x`, `other.html`) to the matching chapter. Internal
 //!   links whose target does not exist in the book lose their `href`, so the
 //!   book never contains dangling references; [`fix_links_with_warnings`]
-//!   reports those.
+//!   reports those. Linked local files that `crate::linked` added are
+//!   chapters with their own `source`, so links to them map the same way;
+//!   [`fix_links_full`] explains why other linked files were left out.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -1539,6 +1541,17 @@ pub fn fix_links_with_warnings(chapters: &mut [Chapter]) -> Vec<String> {
 /// (`../images/x.png`) that name one of the book `resources` (hrefs
 /// relative to `OEBPS/`, e.g. `images/ab12.png`).
 pub fn fix_links_with_resources(chapters: &mut [Chapter], resources: &[String]) -> Vec<String> {
+    fix_links_full(chapters, resources, &HashMap::new())
+}
+
+/// Like [`fix_links_with_resources`]. `skipped` maps the [`source_key`] of
+/// local files that were not added to the book to the reason why; a link to
+/// one of them is removed with a warning that gives the reason.
+pub fn fix_links_full(
+    chapters: &mut [Chapter],
+    resources: &[String],
+    skipped: &HashMap<PathBuf, String>,
+) -> Vec<String> {
     let mut index = LinkIndex::build(chapters);
     index.resources = resources.iter().cloned().collect();
     let mut warnings = Vec::new();
@@ -1564,11 +1577,22 @@ pub fn fix_links_with_resources(chapters: &mut [Chapter], resources: &[String]) 
                             }
                         }
                         Resolved::Broken => {
-                            let msg = format!(
-                                "{}: link target '{}' not found in the book; link removed",
-                                index.source_label(i),
-                                v
-                            );
+                            let reason = index.sources[i]
+                                .as_deref()
+                                .and_then(|src| local_link_target(&link_base(src), v))
+                                .and_then(|p| skipped.get(&source_key(&p)));
+                            let msg = match reason {
+                                Some(reason) => format!(
+                                    "{}: link to local file '{}' removed: {reason}",
+                                    index.source_label(i),
+                                    v
+                                ),
+                                None => format!(
+                                    "{}: link target '{}' not found in the book; link removed",
+                                    index.source_label(i),
+                                    v
+                                ),
+                            };
                             if seen_warnings.insert(msg.clone()) {
                                 warnings.push(msg);
                             }
@@ -1884,9 +1908,75 @@ impl LinkIndex {
     }
 }
 
+/// Every `href` of an `<a>` or `<area>` start tag in serialized XHTML, in
+/// document order (attribute values unescaped).
+pub fn link_hrefs(xhtml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    rewrite_start_tags(xhtml, |tag, attrs| {
+        if tag == "a" || tag == "area" {
+            out.extend(
+                attrs
+                    .iter()
+                    .filter(|(k, _)| k == "href")
+                    .map(|(_, v)| v.clone()),
+            );
+        }
+        false
+    });
+    out
+}
+
+/// Directory that relative links in a chapter from `source` resolve against.
+pub fn link_base(source: &Path) -> PathBuf {
+    source.parent().map(Path::to_path_buf).unwrap_or_default()
+}
+
+/// The local file a link points to, if it names one: a relative or
+/// absolute path (resolved against `base_dir`) or a `file:` URL, with any
+/// `?query` and `#fragment` removed and `%XX` escapes decoded. `None` for
+/// fragment-only links, links with another URL scheme and `//host` links.
+pub fn local_link_target(base_dir: &Path, href: &str) -> Option<PathBuf> {
+    let href = href.trim();
+    if href.is_empty() || href.starts_with('#') || href.starts_with("//") {
+        return None;
+    }
+    let strip = |s: &str| -> String {
+        let s = s.split('#').next().unwrap_or("");
+        s.split('?').next().unwrap_or("").to_string()
+    };
+    if has_scheme(href) {
+        let colon = href.find(':')?;
+        if !href[..colon].eq_ignore_ascii_case("file") {
+            return None;
+        }
+        let rest = strip(&href[colon + 1..]);
+        let path = match rest.strip_prefix("//") {
+            Some(after) => {
+                let (host, p) = after.split_at(after.find('/').unwrap_or(after.len()));
+                if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+                    return None;
+                }
+                p.to_string()
+            }
+            None => rest,
+        };
+        let mut decoded = percent_decode(&path);
+        let b = decoded.as_bytes();
+        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+            decoded.remove(0);
+        }
+        return (!decoded.is_empty()).then(|| PathBuf::from(decoded));
+    }
+    let path = strip(href);
+    if path.is_empty() {
+        return None;
+    }
+    Some(base_dir.join(percent_decode(&path)))
+}
+
 /// Normalized key for comparing input paths: canonical when the file
 /// exists, else lexically cleaned.
-fn source_key(p: &Path) -> PathBuf {
+pub fn source_key(p: &Path) -> PathBuf {
     if let Ok(c) = std::fs::canonicalize(p) {
         return c;
     }
@@ -2636,6 +2726,73 @@ mod tests {
             "{}",
             chapters[2].body_xhtml
         );
+    }
+
+    #[test]
+    fn local_link_targets() {
+        let base = Path::new("docs");
+        let t = |h: &str| local_link_target(base, h);
+        assert_eq!(t("a.md"), Some(PathBuf::from("docs/a.md")));
+        assert_eq!(
+            t("sub/my%20file.svg#x?y"),
+            Some(PathBuf::from("docs/sub/my file.svg"))
+        );
+        assert_eq!(t("x.rs?plain=1#L3"), Some(PathBuf::from("docs/x.rs")));
+        assert_eq!(t("/abs/x.txt"), Some(PathBuf::from("/abs/x.txt")));
+        assert_eq!(
+            t("file:///tmp/a%20b.md#s"),
+            Some(PathBuf::from("/tmp/a b.md"))
+        );
+        assert_eq!(
+            t("file://localhost/tmp/a.md"),
+            Some(PathBuf::from("/tmp/a.md"))
+        );
+        for none in [
+            "",
+            "#frag",
+            "?q",
+            "//cdn.example.com/x.png",
+            "https://example.com/a.md",
+            "mailto:a@b.c",
+            "file://otherhost/x.md",
+        ] {
+            assert_eq!(t(none), None, "{none}");
+        }
+    }
+
+    #[test]
+    fn link_hrefs_lists_anchor_and_area_targets() {
+        let x = r#"<p><a href="a.md">a</a><img src="i.png"/><area href="b&amp;c.txt"/><a name="n">n</a></p>"#;
+        assert_eq!(
+            link_hrefs(x),
+            vec!["a.md".to_string(), "b&c.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn skipped_files_explain_removed_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.md");
+        let mut chapters = vec![Chapter {
+            file_name: "ch001.xhtml".into(),
+            body_xhtml: r#"<a href="blob.bin">b</a><a href="gone.md">g</a>"#.into(),
+            source: Some(src),
+            ..Chapter::default()
+        }];
+        let mut skipped = HashMap::new();
+        skipped.insert(
+            source_key(&dir.path().join("blob.bin")),
+            "it is a binary file".to_string(),
+        );
+        let w = fix_links_full(&mut chapters, &[], &skipped);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(
+            w[0].contains("'blob.bin' removed: it is a binary file"),
+            "{}",
+            w[0]
+        );
+        assert!(w[1].contains("'gone.md' not found in the book"), "{}", w[1]);
+        assert_eq!(chapters[0].body_xhtml, "<a>b</a><a>g</a>");
     }
 
     #[test]

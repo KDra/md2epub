@@ -823,7 +823,14 @@ fn offline_warns_about_remote_image() {
 
 #[test]
 fn html_input_is_sanitized() {
-    let run = convert(&[&fixture("page.html"), "--profile", "scribe"]);
+    // page.html links to kitchen-sink.md, whose task-list checkboxes are
+    // legitimate <input> elements; check page.html on its own.
+    let run = convert(&[
+        &fixture("page.html"),
+        "--profile",
+        "scribe",
+        "--no-follow-links",
+    ]);
     let epub = &run.epub;
     let text: String = epub.chapter_docs().iter().map(|d| epub.text(d)).collect();
     for bad in [
@@ -1292,4 +1299,225 @@ fn build_after_an_input_is_the_subcommand() {
         epub.text("OEBPS/content.opf")
             .contains("<dc:title>B</dc:title>")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Linked local files
+// ---------------------------------------------------------------------------
+
+fn linked_fixture(name: &str) -> String {
+    fixtures()
+        .join("linked")
+        .join(name)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The `<title>` of a spine document (the chapter title).
+fn doc_title(epub: &Epub, doc: &str) -> String {
+    let text = epub.text(doc);
+    let start = text.find("<title>").expect("no <title>") + "<title>".len();
+    let end = text[start..].find("</title>").expect("no </title>") + start;
+    text[start..end].to_string()
+}
+
+/// The `src` of the first `<img>` in a document.
+fn first_img_src(text: &str) -> Option<String> {
+    let at = text.find("<img")?;
+    let tail = &text[at..];
+    let s = tail.find("src=\"")? + 5;
+    let e = tail[s..].find('"')? + s;
+    Some(tail[s..e].to_string())
+}
+
+#[test]
+fn linked_local_files_are_added() {
+    for profile in ["scribe", "generic"] {
+        let run = convert(&[&linked_fixture("a.md"), "--profile", profile]);
+        let epub = &run.epub;
+        let label = format!("linked/{profile}");
+        assert_valid(epub);
+        if profile == "scribe" {
+            assert_device_safe(epub, &label);
+        }
+        let docs = epub.chapter_docs();
+        let titles: Vec<String> = docs.iter().map(|d| doc_title(epub, d)).collect();
+        // Inputs first, then linked documents breadth-first (each once, even
+        // through the a.md <-> b.md cycle), then the "Linked files" pages in
+        // order of first reference.
+        assert_eq!(
+            titles,
+            [
+                "Linked Start",
+                "Second Document",
+                "More Notes",
+                "HTML Page",
+                "Linked files",
+                "flow.svg",
+                "flow.mmd",
+                "example.rs",
+                "notes.txt",
+            ],
+            "{label}"
+        );
+        let file = |i: usize| docs[i].rsplit('/').next().unwrap().to_string();
+        let texts: Vec<String> = docs.iter().map(|d| epub.text(d)).collect();
+        let start = &texts[0];
+        // A fragment that exists is kept, an unknown one goes to the start.
+        assert!(
+            start.contains(&format!("href=\"{}#later\"", file(1))),
+            "{label}: {start}"
+        );
+        for (i, text) in [
+            (1, "unknown anchor"),
+            (5, "diagram image"),
+            (6, "Mermaid source"),
+            (7, "Rust code"),
+            (8, "plain notes"),
+        ] {
+            assert!(
+                start.contains(&format!("href=\"{}\">{text}", file(i))),
+                "{label}: {text}: {start}"
+            );
+        }
+        // Files that cannot be added lose the link but keep the text.
+        for text in ["binary blob", "missing file", "directory"] {
+            assert!(start.contains(&format!("<a>{text}</a>")), "{label}: {text}");
+        }
+        // Web, mail and in-page links are untouched.
+        assert!(start.contains("href=\"https://example.com/\""), "{label}");
+        assert!(
+            start.contains("href=\"mailto:someone@example.com\""),
+            "{label}"
+        );
+        assert!(start.contains("href=\"#linked-start\""), "{label}");
+        // Links between linked documents work too (back to the input,
+        // percent-encoded names, fragments into HTML documents).
+        assert!(
+            texts[1].contains(&format!("href=\"{}\"", file(0))),
+            "{label}"
+        );
+        assert!(
+            texts[1].contains(&format!("href=\"{}\"", file(2))),
+            "{label}"
+        );
+        assert!(
+            texts[2].contains(&format!("href=\"{}#part\"", file(3))),
+            "{label}"
+        );
+        assert!(
+            texts[3].contains(&format!("href=\"{}\"", file(8))),
+            "{label}"
+        );
+
+        // Each failure is explained once, with the reason.
+        let err = &run.stderr;
+        for (name, why) in [
+            ("data.bin", "binary file"),
+            ("missing.md", "does not exist"),
+            ("diagrams/", "directory"),
+        ] {
+            let lines: Vec<&str> = err
+                .lines()
+                .filter(|l| l.contains(&format!("'{name}'")))
+                .collect();
+            assert_eq!(lines.len(), 1, "{label}: {name}: {err}");
+            assert!(lines[0].contains(why), "{label}: {}", lines[0]);
+        }
+        for name in ["b.md", "flow.svg", "example.rs", "notes.txt", "c.html"] {
+            assert!(
+                !err.contains(name),
+                "{label}: unexpected warning about {name}: {err}"
+            );
+        }
+
+        // The image page and the image embedded in b.md share one resource.
+        let page_img = first_img_src(&texts[5]).expect("no image on the flow.svg page");
+        assert_eq!(
+            first_img_src(&texts[1]).as_deref(),
+            Some(page_img.as_str()),
+            "{label}"
+        );
+        if profile == "scribe" {
+            assert!(page_img.ends_with(".png"), "{label}: {page_img}");
+        } else {
+            assert!(page_img.ends_with(".svg"), "{label}: {page_img}");
+        }
+        // The Mermaid page shows the diagram (or the source with a warning).
+        #[cfg(feature = "mermaid")]
+        assert!(texts[6].contains("<img"), "{label}: {}", texts[6]);
+        #[cfg(not(feature = "mermaid"))]
+        assert!(
+            texts[6].contains("<img") || (texts[6].contains("A[Start]") && err.contains("Mermaid")),
+            "{label}: {}",
+            texts[6]
+        );
+        // Source code is highlighted; plain text is escaped.
+        assert!(texts[7].contains("language-rs") && texts[7].contains("<span style="));
+        assert!(texts[8].contains("Plain notes &lt;with&gt; &amp; special"));
+
+        // The non-document pages nest under "Linked files" in the nav.
+        let nav = epub.text("OEBPS/nav.xhtml");
+        let section = nav.split_once("Linked files</a>").expect("no section").1;
+        let nested = section.split_once("<ol>").expect("no nested list").1;
+        let nested = nested.split_once("</ol>").expect("unclosed list").0;
+        for name in ["flow.svg", "flow.mmd", "example.rs", "notes.txt"] {
+            assert!(
+                nested.contains(&format!(">{name}</a>")),
+                "{label}: {name} in {nav}"
+            );
+        }
+        assert!(!nested.contains("More Notes"), "{label}");
+        // Linked files never name the book.
+        let opf = epub.text("OEBPS/content.opf");
+        assert!(opf.contains(">Linked Start</dc:title>"), "{label}");
+    }
+}
+
+#[test]
+fn follow_links_can_be_turned_off() {
+    let run = convert(&[&linked_fixture("a.md"), "--no-follow-links"]);
+    assert_valid(&run.epub);
+    assert_eq!(run.epub.chapter_docs().len(), 1);
+    let text = run.epub.text(&run.epub.chapter_docs()[0]);
+    assert!(text.contains("<a>Rust code</a>"), "{text}");
+    assert!(run.stderr.contains("turned off"), "{}", run.stderr);
+
+    // The same from book.toml, and --follow-links wins over it.
+    let dir = TempDir::new().unwrap();
+    let toml = dir.path().join("book.toml");
+    let input = linked_fixture("a.md").replace('\\', "/");
+    std::fs::write(
+        &toml,
+        format!("inputs = [\"{input}\"]\nfollow-links = false\n"),
+    )
+    .unwrap();
+    let toml = toml.to_string_lossy().into_owned();
+    let off = convert(&["build", &toml]);
+    assert_eq!(off.epub.chapter_docs().len(), 1);
+    let on = convert(&["build", &toml, "--follow-links"]);
+    assert!(on.epub.chapter_docs().len() > 1);
+}
+
+#[test]
+fn links_to_explicit_inputs_are_not_duplicated() {
+    // b.md is an input too: it stays where it was given, and a.md's link
+    // maps to it instead of adding it a second time.
+    let run = convert(&[&linked_fixture("a.md"), &linked_fixture("b.md")]);
+    let epub = &run.epub;
+    assert_valid(epub);
+    let titles: Vec<String> = epub
+        .chapter_docs()
+        .iter()
+        .map(|d| doc_title(epub, d))
+        .collect();
+    assert_eq!(
+        titles
+            .iter()
+            .filter(|t| t.as_str() == "Second Document")
+            .count(),
+        1
+    );
+    assert_eq!(titles[1], "Second Document");
+    assert_eq!(titles[2], "More Notes");
 }

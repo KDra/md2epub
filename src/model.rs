@@ -238,6 +238,9 @@ pub struct Options {
     /// matter). When it was not, the `<html lang>` of the first HTML input
     /// may set the book language.
     pub lang_given: bool,
+    /// Add local files that chapters link to (documents, images, diagrams,
+    /// text) to the book. See `linked`.
+    pub follow_links: bool,
 }
 
 impl Default for Options {
@@ -264,6 +267,7 @@ impl Default for Options {
             verbose: false,
             output: None,
             lang_given: false,
+            follow_links: true,
         }
     }
 }
