@@ -1382,9 +1382,9 @@ fn linked_local_files_are_added() {
                 "More Notes",
                 "HTML Page",
                 "Linked files",
-                "flow.svg",
-                "flow.mmd",
-                "example.rs",
+                "diagrams/flow.svg",
+                "diagrams/flow.mmd",
+                "src/example.rs",
                 "notes.txt",
             ],
             "{label}"
@@ -1490,7 +1490,12 @@ fn linked_local_files_are_added() {
         let section = nav.split_once("Linked files</a>").expect("no section").1;
         let nested = section.split_once("<ol>").expect("no nested list").1;
         let nested = nested.split_once("</ol>").expect("unclosed list").0;
-        for name in ["flow.svg", "flow.mmd", "example.rs", "notes.txt"] {
+        for name in [
+            "diagrams/flow.svg",
+            "diagrams/flow.mmd",
+            "src/example.rs",
+            "notes.txt",
+        ] {
             assert!(
                 nested.contains(&format!(">{name}</a>")),
                 "{label}: {name} in {nav}"
@@ -1876,4 +1881,475 @@ fn input_named_config_needs_a_path_prefix() {
     let out = run_with_config(&["config", "path"], &no_config, Some(dir.path()));
     assert!(out.status.success());
     assert!(stdout_of(&out).contains("none.toml"));
+}
+
+// ---------------------------------------------------------------------------
+// Link confinement and link resolution
+// ---------------------------------------------------------------------------
+
+/// Writes `files` (path relative to `dir`, contents) under `dir`.
+fn write_tree(dir: &Path, files: &[(&str, &str)]) {
+    for (name, text) in files {
+        let path = dir.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+}
+
+/// Converts with the default (empty) user config in `cwd`, writing
+/// `<cwd>/out.epub`, and returns the book and stderr.
+fn convert_in(cwd: &Path, args: &[&str]) -> (Epub, String) {
+    let out = cwd.join("out.epub");
+    let out_str = out.to_string_lossy().into_owned();
+    let mut all = args.to_vec();
+    all.extend(["--offline", "-o", &out_str]);
+    let no_config = cwd.join("no-user-config.toml");
+    let res = run_with_config(&all, &no_config, Some(cwd));
+    let stderr = stderr_of(&res);
+    assert!(res.status.success(), "{all:?}: {stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    let epub = Epub::open(&out);
+    assert_valid(&epub);
+    (epub, stderr)
+}
+
+/// All chapter text of a book, concatenated.
+fn all_text(epub: &Epub) -> String {
+    epub.chapter_docs().iter().map(|d| epub.text(d)).collect()
+}
+
+/// Top-level nav entries with the labels of their direct children.
+fn nav_outline(epub: &Epub) -> Vec<(String, Vec<String>)> {
+    let nav = epub.text("OEBPS/nav.xhtml");
+    let doc = parse_xml("nav.xhtml", &nav);
+    let toc = doc
+        .descendants()
+        .find(|n| {
+            n.has_tag_name((XHTML_NS, "nav"))
+                && n.attributes()
+                    .any(|a| a.name() == "type" && a.value() == "toc")
+        })
+        .expect("no toc nav");
+    let ol = toc
+        .children()
+        .find(|n| n.has_tag_name((XHTML_NS, "ol")))
+        .unwrap();
+    let label = |li: roxmltree::Node| -> String {
+        li.children()
+            .find(|n| n.has_tag_name((XHTML_NS, "a")) || n.has_tag_name((XHTML_NS, "span")))
+            .and_then(|a| a.text())
+            .unwrap_or_default()
+            .to_string()
+    };
+    ol.children()
+        .filter(|n| n.has_tag_name((XHTML_NS, "li")))
+        .map(|li| {
+            let kids = li
+                .children()
+                .find(|n| n.has_tag_name((XHTML_NS, "ol")))
+                .map(|ol| {
+                    ol.children()
+                        .filter(|n| n.has_tag_name((XHTML_NS, "li")))
+                        .map(label)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (label(li), kids)
+        })
+        .collect()
+}
+
+#[test]
+fn links_outside_the_project_are_not_followed() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    write_tree(
+        d,
+        &[
+            ("fakehome/.ssh/id_ed25519", "FAKE PRIVATE KEY"),
+            ("outside/hosts.txt", "OUTSIDE SECRET"),
+            ("outside/other.txt", "OTHER SECRET"),
+            ("p1/inside.txt", "inside text"),
+            ("p1/.env", "TOKEN=FAKE"),
+        ],
+    );
+    let outside = d.join("outside").join("hosts.txt");
+    let outside = outside.to_string_lossy().replace('\\', "/");
+    write_tree(
+        d,
+        &[(
+            "p1/notes.md",
+            &format!(
+                "# Notes\n\n<a href=\"../fakehome/.ssh/id_ed25519\"></a> [abs]({outside}) \
+                 [up](../outside/other.txt) [env](.env) [in](inside.txt) [etc](/etc/hosts)\n"
+            ),
+        )],
+    );
+    let (epub, stderr) = convert_in(d, &["p1/notes.md"]);
+    let text = all_text(&epub);
+    for secret in [
+        "FAKE PRIVATE KEY",
+        "OUTSIDE SECRET",
+        "OTHER SECRET",
+        "TOKEN=FAKE",
+        "localhost",
+    ] {
+        assert!(!text.contains(secret), "{secret} leaked into the book");
+    }
+    assert!(text.contains("inside text"));
+    // Every refused link is explained without -v.
+    for (href, why) in [
+        ("../fakehome/.ssh/id_ed25519", "outside the project folder"),
+        ("../outside/other.txt", "outside the project folder"),
+        (outside.as_str(), "outside the project folder"),
+        (".env", "hidden"),
+    ] {
+        let line = stderr
+            .lines()
+            .find(|l| l.contains(&format!("'{href}'")))
+            .unwrap_or_else(|| panic!("no warning for {href}: {stderr}"));
+        assert!(line.contains(why), "{line}");
+    }
+    #[cfg(unix)]
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l.contains("'/etc/hosts'") && l.contains("outside the project folder")),
+        "{stderr}"
+    );
+
+    // --link-root widens the root: the outside file is added, with a
+    // warning; hidden files and folders stay out.
+    let (epub, stderr) = convert_in(d, &["p1/notes.md", "--link-root", "."]);
+    let text = all_text(&epub);
+    assert!(text.contains("OUTSIDE SECRET"));
+    assert!(!text.contains("FAKE PRIVATE KEY") && !text.contains("TOKEN=FAKE"));
+    assert!(stderr.contains("outside the inputs' folder"), "{stderr}");
+    let out = run_raw(&[&linked_fixture("a.md"), "--link-root", "/no/such/dir"]);
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("link root"), "{}", stderr_of(&out));
+}
+
+#[test]
+fn root_relative_links_resolve_in_the_git_work_tree() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    std::fs::create_dir(d.join(".git")).unwrap();
+    write_tree(
+        d,
+        &[
+            (
+                "README.md",
+                "# My Project\n\nSee [rr](/docs/guide.md#setup).\n",
+            ),
+            ("docs/guide.md", "# Guide\n\n## Setup\n\nSteps.\n"),
+            ("docs/index.md", "# Index\n\n[readme](/README.md)\n"),
+        ],
+    );
+    let (epub, stderr) = convert_in(d, &["README.md"]);
+    assert!(!stderr.contains("/docs/guide.md"), "{stderr}");
+    let docs = epub.chapter_docs();
+    assert_eq!(docs.len(), 2, "{stderr}");
+    let guide = docs[1].rsplit('/').next().unwrap();
+    assert!(
+        epub.text(&docs[0])
+            .contains(&format!("href=\"{guide}#setup\"")),
+        "{}",
+        epub.text(&docs[0])
+    );
+    // From a subdirectory input, `/` is still the work tree.
+    let (epub, stderr) = convert_in(d, &["docs/index.md"]);
+    assert_eq!(epub.chapter_docs().len(), 3, "{stderr}");
+    // The README is outside the inputs' folder, which is worth a warning.
+    assert!(stderr.contains("outside the inputs' folder"), "{stderr}");
+}
+
+#[test]
+fn linked_document_without_h1_gets_its_own_toc_entry() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    write_tree(
+        d,
+        &[
+            (
+                "README.md",
+                "# My Project\n\nSee the [changelog](CHANGELOG.md).\n\n## Install\n\nRun it.\n",
+            ),
+            (
+                "CHANGELOG.md",
+                "## v1.1.0\n\nNew things.\n\n## v1.0.0\n\nFirst.\n",
+            ),
+        ],
+    );
+    let (epub, _) = convert_in(d, &["README.md"]);
+    let outline = nav_outline(&epub);
+    assert_eq!(
+        outline,
+        vec![
+            ("My Project".to_string(), vec!["Install".to_string()]),
+            (
+                "CHANGELOG.md".to_string(),
+                vec!["v1.1.0".to_string(), "v1.0.0".to_string()]
+            ),
+        ]
+    );
+}
+
+#[test]
+fn scripted_svg_is_cleaned() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    write_tree(
+        d,
+        &[
+            (
+                "s.svg",
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"20\" height=\"20\">\
+                 <script>alert(1)</script><rect width=\"20\" height=\"20\" onclick=\"alert(2)\"/></svg>",
+            ),
+            ("in.md", "# S\n\n[s](s.svg)\n\n![x](s.svg)\n"),
+        ],
+    );
+    let (epub, _) = convert_in(d, &["in.md", "--profile", "generic"]);
+    let svgs: Vec<&str> = epub.names().filter(|n| n.ends_with(".svg")).collect();
+    assert_eq!(svgs.len(), 1, "{svgs:?}");
+    let svg = epub.text(svgs[0]);
+    assert!(!svg.contains("script") && !svg.contains("onclick"), "{svg}");
+    assert!(svg.contains("<rect"), "{svg}");
+}
+
+#[test]
+fn html_link_to_an_existing_markdown_file_is_followed() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    write_tree(
+        d,
+        &[
+            ("docs/guide.md", "# Guide\n"),
+            ("in.md", "# In\n\n[h](docs/guide.html)\n"),
+        ],
+    );
+    let (epub, stderr) = convert_in(d, &["in.md"]);
+    let docs = epub.chapter_docs();
+    assert_eq!(docs.len(), 2, "{stderr}");
+    assert!(!stderr.contains("does not exist"), "{stderr}");
+    let guide = docs[1].rsplit('/').next().unwrap();
+    assert!(epub.text(&docs[0]).contains(&format!("href=\"{guide}\"")));
+}
+
+#[test]
+fn relative_file_urls_resolve_against_the_linking_file() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    write_tree(
+        d,
+        &[
+            ("i.md", "# Wrong I\n"),
+            ("p6/i.md", "# I\n"),
+            ("p6/w.html", "<h1>W</h1><p><a href=\"file:i.md\">i</a></p>"),
+        ],
+    );
+    let (epub, _) = convert_in(d, &["p6/w.html"]);
+    let titles: Vec<String> = epub
+        .chapter_docs()
+        .iter()
+        .map(|doc| doc_title(&epub, doc))
+        .collect();
+    assert_eq!(titles, ["W", "I"]);
+}
+
+#[test]
+fn same_named_linked_files_are_told_apart() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    write_tree(
+        d,
+        &[
+            ("a/mod.rs", "fn a() {}\n"),
+            ("b/mod.rs", "fn b() {}\n"),
+            ("in.md", "# In\n\n[a](a/mod.rs) [b](b/mod.rs)\n"),
+        ],
+    );
+    let (epub, _) = convert_in(d, &["in.md"]);
+    let outline = nav_outline(&epub);
+    let linked = outline
+        .iter()
+        .find(|(l, _)| l == "Linked files")
+        .expect("no Linked files section");
+    assert_eq!(linked.1, ["a/mod.rs", "b/mod.rs"]);
+    let text = all_text(&epub);
+    assert!(text.contains(">a/mod.rs</h2>"), "{text}");
+}
+
+#[test]
+fn backslash_links_resolve_and_warnings_show_decoded_hrefs() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    write_tree(
+        d,
+        &[
+            ("docs/guide.md", "# Guide\n"),
+            (
+                "README.md",
+                "# R\n\n[w](docs\\guide.md) [c](docs/café.md) [s](docs/my%20x.md)\n",
+            ),
+        ],
+    );
+    for extra in [&[][..], &["--no-follow-links"][..]] {
+        let mut args = vec!["README.md"];
+        args.extend_from_slice(extra);
+        let (epub, stderr) = convert_in(d, &args);
+        assert!(stderr.contains("'docs/café.md'"), "{stderr}");
+        assert!(stderr.contains("'docs/my x.md'"), "{stderr}");
+        assert!(!stderr.contains('%'), "{stderr}");
+        if extra.is_empty() {
+            assert_eq!(epub.chapter_docs().len(), 2, "{stderr}");
+            assert!(!stderr.contains("guide.md"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn no_follow_links_warnings_are_precise() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    write_tree(
+        d,
+        &[
+            ("docs/guide.md", "# Guide\n\n## Setup\n"),
+            (
+                "R2.md",
+                "# R\n\n[d](docs/) [1](docs/guide.md#setup) [2](./docs/../docs/guide.md) [3](docs/guide.md)\n",
+            ),
+        ],
+    );
+    let (_, stderr) = convert_in(d, &["R2.md", "--no-follow-links"]);
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("warning:"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{stderr}");
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("turned off")).count(),
+        1,
+        "{stderr}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("'docs/'") && l.contains("directory")),
+        "{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// User config interplay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn user_config_lang_is_a_fallback_for_html_lang() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    write_tree(
+        d,
+        &[
+            (
+                "g.html",
+                "<!DOCTYPE html><html lang=\"de\"><body><h1>G</h1></body></html>",
+            ),
+            ("m.md", "# M\n"),
+        ],
+    );
+    let config = d.join("config.toml");
+    config_ok(&config, &["set", "lang", "fr"]);
+    let out = d.join("o.epub");
+    let lang_of = |input: &str| {
+        let res = run_with_config(
+            &[input, "--offline", "-o", out.to_str().unwrap()],
+            &config,
+            Some(d),
+        );
+        assert!(res.status.success(), "{}", stderr_of(&res));
+        let opf = Epub::open(&out).text("OEBPS/content.opf");
+        let start = opf.find("<dc:language>").unwrap() + "<dc:language>".len();
+        opf[start..start + opf[start..].find('<').unwrap()].to_string()
+    };
+    assert_eq!(lang_of("g.html"), "de");
+    assert_eq!(lang_of("m.md"), "fr");
+    let help = stdout_of(&run_with_config(&["--help"], &config, None));
+    assert!(
+        help.contains("[default: the first HTML input's <html lang>, else fr]"),
+        "{help}"
+    );
+}
+
+#[test]
+fn config_set_refuses_while_the_file_is_invalid() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "margin = 3\n").unwrap();
+    let out = run_with_config(&["config", "set", "profile", "scribe"], &config, None);
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("not saved") && stderr.contains("margin"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), "margin = 3\n");
+    config_ok(&config, &["set", "margin", "wide"]);
+    config_ok(&config, &["set", "profile", "scribe"]);
+    assert_eq!(config_ok(&config, &["get", "profile"]).trim_end(), "scribe");
+}
+
+#[test]
+fn missing_user_css_points_at_the_user_config() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, "css = \"missing.css\"\n").unwrap();
+    let out = run_with_config(
+        &[&fixture("page.html"), "--offline"],
+        &config,
+        Some(dir.path()),
+    );
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("missing.css")
+            && stderr.contains("config.toml")
+            && stderr.contains("md2epub config unset css"),
+        "{stderr}"
+    );
+    let msg = config_ok(&config, &["unset", "css"]);
+    assert!(msg.contains("removed css"), "{msg}");
+}
+
+#[test]
+fn config_with_inputs_gives_no_dead_end_hint() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config.toml");
+    let out = run_with_config(&[&fixture("page.html"), "config"], &config, None);
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(!stderr.contains("./config"), "{stderr}");
+    let help = stdout_of(&run_with_config(&["config", "--help"], &config, None));
+    assert!(!help.contains("./config"), "{help}");
+}
+
+#[cfg(windows)]
+#[test]
+fn config_edit_on_windows_runs_cmd_shims_and_quoted_paths() {
+    let dir = TempDir::new().unwrap();
+    let tools = dir.path().join("my tools");
+    std::fs::create_dir(&tools).unwrap();
+    let shim = tools.join("edit me.cmd");
+    std::fs::write(&shim, "@echo margin = \"wide\">>%1\r\n").unwrap();
+    let config = dir.path().join("cfg dir").join("config.toml");
+    let out = Command::new(env!("CARGO_BIN_EXE_md2epub"))
+        .args(["config", "edit"])
+        .env("MD2EPUB_CONFIG", &config)
+        .env("VISUAL", format!("\"{}\"", shim.display()))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(config_ok(&config, &["get", "margin"]).trim_end(), "wide");
 }

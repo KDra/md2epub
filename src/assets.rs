@@ -1428,7 +1428,41 @@ fn prepare_svg(
         }
     }
     if mode == SvgMode::Keep {
-        // A kept SVG is a book resource: its CSS references must be too.
+        // A kept SVG is a book resource, so it must not be scripted (EPUB
+        // would require the `scripted` property, and readers do not run
+        // scripts anyway).
+        let mut removed_script = false;
+        for tag in &tags {
+            if tag.local == "script" {
+                let end = if tag.self_closing {
+                    tag.range.end
+                } else {
+                    let close = find_end_tag(text, tag.range.end, "script");
+                    text[close..]
+                        .find('>')
+                        .map_or(text.len(), |e| close + e + 1)
+                };
+                edits.push((tag.range.start..end, String::new()));
+                removed_script = true;
+                continue;
+            }
+            for a in &tag.attrs {
+                let value = xml_unescape(&text[a.value.clone()]);
+                let scripted_url = matches!(a.local.as_str(), "href" | "src" | "action")
+                    && value
+                        .trim()
+                        .get(..11)
+                        .is_some_and(|p| p.eq_ignore_ascii_case("javascript:"));
+                if a.local.starts_with("on") || scripted_url {
+                    edits.push((a.full.clone(), String::new()));
+                    removed_script = true;
+                }
+            }
+        }
+        if removed_script {
+            ctx.info("scripts and event handlers removed from an SVG image");
+        }
+        // Its CSS references must be book resources too.
         for tag in &tags {
             for a in tag.attrs.iter().filter(|a| a.local == "style") {
                 let css = xml_unescape(&text[a.value.clone()]);
@@ -2183,6 +2217,38 @@ mod tests {
         let out = prepare_svg(svg, &base, SvgMode::Keep, &mut ctx, 0).unwrap();
         assert!(!out.contains("missing.png") && out.contains("#ok"));
         assert_eq!(ctx.warnings().len(), 1);
+    }
+
+    #[test]
+    fn kept_svgs_lose_scripts_and_event_handlers() {
+        let dir = tempfile::tempdir().unwrap();
+        let svg = concat!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10" onload="x()">"#,
+            r#"<script type="text/javascript"><![CDATA[ if (a < b) { alert(1) } ]]></script>"#,
+            r#"<svg:script xmlns:svg="http://www.w3.org/2000/svg">alert(2)</svg:script><script href="x.js"/>"#,
+            r#"<a xlink:href=" JavaScript:alert(3)"><rect width="5" height="5" onclick="y()" ONMOUSEOVER="z()"/></a>"#,
+            r##"<a href="#ok"><circle r="1" opacity="0.5"/></a></svg>"##
+        );
+        std::fs::write(dir.path().join("s.svg"), svg).unwrap();
+        let mut ctx = ctx();
+        ctx.base_dir = dir.path().to_path_buf();
+        run(r#"<img src="s.svg" alt="s">"#, &mut ctx);
+        assert!(ctx.warnings().is_empty(), "{:?}", ctx.warnings());
+        let kept = String::from_utf8(ctx.resources()[0].data.clone()).unwrap();
+        for gone in [
+            "script",
+            "alert",
+            "onload",
+            "onclick",
+            "ONMOUSEOVER",
+            "JavaScript",
+        ] {
+            assert!(!kept.contains(gone), "{gone} in {kept}");
+        }
+        for stays in [r##"href="#ok""##, r#"opacity="0.5""#, "<rect", "</svg>"] {
+            assert!(kept.contains(stays), "{stays} missing from {kept}");
+        }
+        assert!(roxmltree::Document::parse(&kept).is_ok(), "{kept}");
     }
 
     #[test]

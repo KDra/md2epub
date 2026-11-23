@@ -1541,21 +1541,27 @@ pub fn fix_links_with_warnings(chapters: &mut [Chapter]) -> Vec<String> {
 /// (`../images/x.png`) that name one of the book `resources` (hrefs
 /// relative to `OEBPS/`, e.g. `images/ab12.png`).
 pub fn fix_links_with_resources(chapters: &mut [Chapter], resources: &[String]) -> Vec<String> {
-    fix_links_full(chapters, resources, &HashMap::new())
+    fix_links_full(chapters, resources, &HashMap::new(), None)
 }
 
 /// Like [`fix_links_with_resources`]. `skipped` maps the [`source_key`] of
 /// local files that were not added to the book to the reason why; a link to
-/// one of them is removed with a warning that gives the reason.
+/// one of them is removed with a warning that gives the reason (one warning
+/// per linking file, target file and reason, whatever the href spelling).
+/// `root` is the project root that root-relative links (`/docs/a.md`)
+/// resolve against (see [`local_link_target`]).
 pub fn fix_links_full(
     chapters: &mut [Chapter],
     resources: &[String],
     skipped: &HashMap<PathBuf, String>,
+    root: Option<&Path>,
 ) -> Vec<String> {
     let mut index = LinkIndex::build(chapters);
     index.resources = resources.iter().cloned().collect();
+    index.root = root.map(Path::to_path_buf);
     let mut warnings = Vec::new();
     let mut seen_warnings = HashSet::new();
+    let mut seen_skipped: HashSet<(usize, PathBuf, String)> = HashSet::new();
     for (i, chapter) in chapters.iter_mut().enumerate() {
         let mut changed = false;
         let rewritten = rewrite_start_tags(&chapter.body_xhtml, |tag, attrs| {
@@ -1577,20 +1583,27 @@ pub fn fix_links_full(
                             }
                         }
                         Resolved::Broken => {
-                            let reason = index.sources[i]
+                            let skip = index.sources[i]
                                 .as_deref()
-                                .and_then(|src| local_link_target(&link_base(src), v))
-                                .and_then(|p| skipped.get(&source_key(&p)));
-                            let msg = match reason {
-                                Some(reason) => format!(
-                                    "{}: link to local file '{}' removed: {reason}",
-                                    index.source_label(i),
-                                    v
-                                ),
+                                .and_then(|src| local_link_target(&link_base(src), root, v))
+                                .map(|p| source_key(&p))
+                                .and_then(|key| skipped.get(&key).map(|r| (key, r)));
+                            // Warnings quote the href as the source spells it.
+                            let shown = percent_decode(v);
+                            let msg = match skip {
+                                Some((key, reason)) => {
+                                    if !seen_skipped.insert((i, key, reason.clone())) {
+                                        drop_href = true;
+                                        continue;
+                                    }
+                                    format!(
+                                        "{}: link to local file '{shown}' removed: {reason}",
+                                        index.source_label(i),
+                                    )
+                                }
                                 None => format!(
-                                    "{}: link target '{}' not found in the book; link removed",
+                                    "{}: link target '{shown}' not found in the book; link removed",
                                     index.source_label(i),
-                                    v
                                 ),
                             };
                             if seen_warnings.insert(msg.clone()) {
@@ -1665,6 +1678,8 @@ struct LinkIndex {
     first_chapter: HashMap<PathBuf, usize>,
     /// Book resource hrefs relative to `OEBPS/` (`images/ab.png`).
     resources: HashSet<String>,
+    /// Project root for root-relative links.
+    root: Option<PathBuf>,
 }
 
 impl LinkIndex {
@@ -1680,6 +1695,7 @@ impl LinkIndex {
             orig_ids: HashMap::new(),
             first_chapter: HashMap::new(),
             resources: HashSet::new(),
+            root: None,
         };
         for (i, ch) in chapters.iter().enumerate() {
             if let Some(key) = &idx.source_keys[i] {
@@ -1791,12 +1807,7 @@ impl LinkIndex {
             };
         }
         let path = percent_decode(path_part);
-        let base = self.sources[from]
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        let target = base.join(&path);
+        let target = resolve_local_path(&self.base_of(from), self.root.as_deref(), &path);
         let Some(key) = self.match_source(&target) else {
             // Already-resolved chapter links (`ch002.xhtml#x`) and links to
             // book resources (`../images/x.png`) stay as they are.
@@ -1806,6 +1817,14 @@ impl LinkIndex {
             return Resolved::Broken;
         };
         self.link_to_source(from, &key, frag)
+    }
+
+    /// Directory that relative links in chapter `from` resolve against.
+    fn base_of(&self, from: usize) -> PathBuf {
+        self.sources[from]
+            .as_deref()
+            .map(link_base)
+            .unwrap_or_default()
     }
 
     /// Whether `path` (relative to `OEBPS/text/`) names a chapter or a book
@@ -1840,26 +1859,10 @@ impl LinkIndex {
             None => (rest, None),
         };
         let path_part = path_part.split('?').next().unwrap_or("");
-        let path = match path_part.strip_prefix("//") {
-            Some(after) => {
-                let (host, p) = after.split_at(after.find('/').unwrap_or(after.len()));
-                if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
-                    return Resolved::Broken;
-                }
-                p
-            }
-            None => path_part,
-        };
-        let mut decoded = percent_decode(path);
-        // file:///C:/dir -> C:/dir
-        let b = decoded.as_bytes();
-        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
-            decoded.remove(0);
-        }
-        if decoded.is_empty() {
+        let Some(path) = file_url_path(&self.base_of(from), path_part) else {
             return Resolved::Broken;
-        }
-        match self.match_source(Path::new(&decoded)) {
+        };
+        match self.match_source(&path) {
             Some(key) => self.link_to_source(from, &key, frag),
             None => Resolved::Broken,
         }
@@ -1931,11 +1934,14 @@ pub fn link_base(source: &Path) -> PathBuf {
     source.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
-/// The local file a link points to, if it names one: a relative or
-/// absolute path (resolved against `base_dir`) or a `file:` URL, with any
-/// `?query` and `#fragment` removed and `%XX` escapes decoded. `None` for
-/// fragment-only links, links with another URL scheme and `//host` links.
-pub fn local_link_target(base_dir: &Path, href: &str) -> Option<PathBuf> {
+/// The local file a link points to, if it names one: a relative path
+/// (resolved against `base_dir`), a root-relative path or a `file:` URL,
+/// with any `?query` and `#fragment` removed and `%XX` escapes decoded.
+/// `None` for fragment-only links, links with another URL scheme and
+/// `//host` links. See [`resolve_local_path`] for root-relative paths and
+/// backslashes; relative `file:` URLs (`file:a.md`) resolve against
+/// `base_dir` too.
+pub fn local_link_target(base_dir: &Path, root: Option<&Path>, href: &str) -> Option<PathBuf> {
     let href = href.trim();
     if href.is_empty() || href.starts_with('#') || href.starts_with("//") {
         return None;
@@ -1949,29 +1955,78 @@ pub fn local_link_target(base_dir: &Path, href: &str) -> Option<PathBuf> {
         if !href[..colon].eq_ignore_ascii_case("file") {
             return None;
         }
-        let rest = strip(&href[colon + 1..]);
-        let path = match rest.strip_prefix("//") {
-            Some(after) => {
-                let (host, p) = after.split_at(after.find('/').unwrap_or(after.len()));
-                if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
-                    return None;
-                }
-                p.to_string()
-            }
-            None => rest,
-        };
-        let mut decoded = percent_decode(&path);
-        let b = decoded.as_bytes();
-        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
-            decoded.remove(0);
-        }
-        return (!decoded.is_empty()).then(|| PathBuf::from(decoded));
+        return file_url_path(base_dir, &strip(&href[colon + 1..]));
     }
     let path = strip(href);
     if path.is_empty() {
         return None;
     }
-    Some(base_dir.join(percent_decode(&path)))
+    Some(resolve_local_path(base_dir, root, &percent_decode(&path)))
+}
+
+/// The file named by the part of a `file:` URL after the colon (without
+/// query and fragment): `///abs`, `//localhost/abs`, `/abs`, `/C:/dir`, or a
+/// relative path, which resolves against `base_dir`. `None` for another
+/// host or an empty path.
+fn file_url_path(base_dir: &Path, rest: &str) -> Option<PathBuf> {
+    let path = match rest.strip_prefix("//") {
+        Some(after) => {
+            let (host, p) = after.split_at(after.find('/').unwrap_or(after.len()));
+            if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+                return None;
+            }
+            p
+        }
+        None => rest,
+    };
+    let mut decoded = percent_decode(path);
+    // file:///C:/dir -> C:/dir
+    let b = decoded.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        decoded.remove(0);
+    }
+    if decoded.is_empty() {
+        return None;
+    }
+    let b = decoded.as_bytes();
+    let has_drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    if decoded.starts_with(['/', '\\']) || has_drive {
+        Some(PathBuf::from(decoded))
+    } else {
+        Some(base_dir.join(decoded))
+    }
+}
+
+/// Resolves a decoded link path from a file in `base_dir`:
+///
+/// - a path starting with a single `/` is root-relative: it names
+///   `root/<path>` (the project root, see `crate::linked::LinkScope`). When
+///   that does not exist but the path exists as an absolute file system
+///   path, that file is meant (it is then subject to the same confinement
+///   as every linked file). Without a `root`, the path is absolute;
+/// - other paths are relative to `base_dir`. A path written with `\`
+///   separators and no `/` (`docs\guide.md`) is tried with `/` when the
+///   literal name does not exist.
+pub fn resolve_local_path(base_dir: &Path, root: Option<&Path>, path: &str) -> PathBuf {
+    if let Some(root) = root
+        && path.starts_with('/')
+        && !path.starts_with("//")
+    {
+        let in_root = root.join(path.trim_start_matches('/'));
+        let absolute = Path::new(path);
+        if !in_root.exists() && absolute.exists() {
+            return absolute.to_path_buf();
+        }
+        return in_root;
+    }
+    let joined = base_dir.join(path);
+    if path.contains('\\') && !path.contains('/') && !joined.exists() {
+        let alt = base_dir.join(path.replace('\\', "/"));
+        if alt.exists() {
+            return alt;
+        }
+    }
+    joined
 }
 
 /// Normalized key for comparing input paths: canonical when the file
@@ -2731,7 +2786,7 @@ mod tests {
     #[test]
     fn local_link_targets() {
         let base = Path::new("docs");
-        let t = |h: &str| local_link_target(base, h);
+        let t = |h: &str| local_link_target(base, None, h);
         assert_eq!(t("a.md"), Some(PathBuf::from("docs/a.md")));
         assert_eq!(
             t("sub/my%20file.svg#x?y"),
@@ -2747,6 +2802,13 @@ mod tests {
             t("file://localhost/tmp/a.md"),
             Some(PathBuf::from("/tmp/a.md"))
         );
+        // Relative file: URLs are relative to the linking file.
+        assert_eq!(t("file:i.md"), Some(PathBuf::from("docs/i.md")));
+        assert_eq!(
+            t("file:sub/a%20b.md#x"),
+            Some(PathBuf::from("docs/sub/a b.md"))
+        );
+        assert_eq!(t("file:/abs/i.md"), Some(PathBuf::from("/abs/i.md")));
         for none in [
             "",
             "#frag",
@@ -2758,6 +2820,95 @@ mod tests {
         ] {
             assert_eq!(t(none), None, "{none}");
         }
+    }
+
+    #[test]
+    fn root_relative_and_backslash_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("docs/sub")).unwrap();
+        std::fs::write(root.join("docs/guide.md"), "# G").unwrap();
+        let base = root.join("docs/sub");
+        let t = |h: &str| local_link_target(&base, Some(root), h);
+        // `/x` is relative to the project root, not the file system root.
+        assert_eq!(t("/docs/guide.md#s"), Some(root.join("docs/guide.md")));
+        assert_eq!(t("/docs/missing.md"), Some(root.join("docs/missing.md")));
+        // An absolute path that exists (and is not under the root) is kept,
+        // so confinement can explain why it is not added.
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let abs = outside.path().to_string_lossy().replace('\\', "/");
+        if abs.starts_with('/') {
+            assert_eq!(t(&abs), Some(PathBuf::from(&abs)));
+        }
+        // `..\guide.md` written with backslashes (percent-encoded by the
+        // Markdown renderer) is found with `/` separators.
+        assert_eq!(t("..%5Cguide.md"), Some(base.join("../guide.md")));
+        // ... but only when the literal name does not exist.
+        assert_eq!(t("a%5Cb.md"), Some(base.join("a\\b.md")));
+    }
+
+    #[test]
+    fn link_index_resolves_root_relative_file_url_and_backslash_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        let readme = root.join("README.md");
+        let guide = root.join("docs/guide.md");
+        let w = root.join("docs/w.html");
+        for p in [&readme, &guide, &w] {
+            std::fs::write(p, "x").unwrap();
+        }
+        let chapter = |file: &str, src: &Path, body: &str| Chapter {
+            file_name: file.into(),
+            body_xhtml: body.into(),
+            source: Some(src.to_path_buf()),
+            ..Chapter::default()
+        };
+        let mut chapters = vec![
+            chapter(
+                "ch001.xhtml",
+                &readme,
+                r#"<a href="/docs/guide.md">r</a><a href="docs%5Cguide.md">b</a>"#,
+            ),
+            chapter("ch002.xhtml", &guide, r#"<p>g</p>"#),
+            chapter("ch003.xhtml", &w, r#"<a href="file:guide.md">f</a>"#),
+        ];
+        let warnings = fix_links_full(&mut chapters, &[], &HashMap::new(), Some(root));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            chapters[0].body_xhtml,
+            r#"<a href="ch002.xhtml">r</a><a href="ch002.xhtml">b</a>"#
+        );
+        assert_eq!(chapters[2].body_xhtml, r#"<a href="ch002.xhtml">f</a>"#);
+    }
+
+    #[test]
+    fn removal_warnings_are_decoded_and_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("a.md");
+        let mut chapters = vec![Chapter {
+            file_name: "ch001.xhtml".into(),
+            body_xhtml: concat!(
+                r#"<a href="docs/guide.md#setup">1</a><a href="./docs/../docs/guide.md">2</a>"#,
+                r#"<a href="docs/guide.md">3</a><a href="docs/caf%C3%A9.md">4</a>"#
+            )
+            .into(),
+            source: Some(src),
+            ..Chapter::default()
+        }];
+        let mut skipped = HashMap::new();
+        skipped.insert(
+            source_key(&dir.path().join("docs/guide.md")),
+            "turned off".to_string(),
+        );
+        let w = fix_links_full(&mut chapters, &[], &skipped, None);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(
+            w[0].contains("'docs/guide.md#setup' removed: turned off"),
+            "{w:?}"
+        );
+        assert!(w[1].contains("'docs/café.md'"), "{w:?}");
+        assert_eq!(chapters[0].body_xhtml, "<a>1</a><a>2</a><a>3</a><a>4</a>");
     }
 
     #[test]
@@ -2784,7 +2935,7 @@ mod tests {
             source_key(&dir.path().join("blob.bin")),
             "it is a binary file".to_string(),
         );
-        let w = fix_links_full(&mut chapters, &[], &skipped);
+        let w = fix_links_full(&mut chapters, &[], &skipped, None);
         assert_eq!(w.len(), 2, "{w:?}");
         assert!(
             w[0].contains("'blob.bin' removed: it is a binary file"),

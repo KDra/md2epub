@@ -59,7 +59,7 @@ fn config_main(cli: &Cli, action: Option<&md2epub::cli::ConfigAction>) -> ExitCo
         eprintln!(
             "error: `md2epub config` takes no input files or conversion options \
              (use `md2epub config set <key> <value>` to change a default; \
-             to convert a file named `config`, write `./config`)"
+             inputs need a .md or .html extension, so a file named `config` cannot be one)"
         );
         return ExitCode::FAILURE;
     }

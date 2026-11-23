@@ -173,6 +173,10 @@ pub fn help_defaults(user: &UserConfig) -> Vec<(&'static str, String)> {
         "front matter, then first heading, then file name".into(),
     ));
     out.push(("cover", "none (a title page is generated)".into()));
+    out.push((
+        "link_root",
+        "the git work tree of the inputs, else their common folder".into(),
+    ));
     for s in settings {
         let id = match s.key {
             "author" => "authors",
@@ -187,6 +191,7 @@ pub fn help_defaults(user: &UserConfig) -> Vec<(&'static str, String)> {
         let value = match s.value.as_str() {
             "true" => "on".to_string(),
             "false" => "off".to_string(),
+            _ if s.key == "lang" => format!("the first HTML input's <html lang>, else {}", s.value),
             _ => s.value,
         };
         out.push((id, value));
@@ -426,6 +431,14 @@ fn set(path: &Path, raw_key: &str, values: &[String], out: &mut dyn Write) -> Re
             }
         }
     }
+    // The new value is fine; make sure the file as a whole still is.
+    UserConfig::from_toml_str(&doc.to_string(), base).map_err(|e| {
+        anyhow!(
+            "config set {key}: not saved, because {} has another problem: {e:#} \
+             (fix it with `md2epub config edit` or `md2epub config unset <key>`)",
+            path.display()
+        )
+    })?;
     write_document(path, &doc)?;
     let shown = settings(&UserConfig::from_toml_str(&single.to_string(), base)?)?
         .into_iter()
@@ -512,6 +525,36 @@ fn editor() -> String {
         .unwrap_or_else(|| if cfg!(windows) { "notepad" } else { "vi" }.into())
 }
 
+/// The command that opens `path` in `editor`. The editor may carry
+/// arguments (`code --wait`) or be a quoted path with spaces, so a shell
+/// splits it: `sh -c` on Unix, `cmd /C` on Windows (which also finds `.cmd`
+/// and `.bat` programs such as VS Code's `code`).
+#[cfg(not(windows))]
+fn editor_command(editor: &str, path: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(path);
+    cmd
+}
+
+#[cfg(windows)]
+fn editor_command(editor: &str, path: &Path) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.raw_arg(windows_editor_line(editor, path));
+    cmd
+}
+
+/// The `cmd` arguments that run `editor` on `path`: with `/S`, `cmd` strips
+/// only the outer quotes, so a quoted editor path and the quoted file path
+/// survive as written. (Windows paths cannot contain `"`.)
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_editor_line(editor: &str, path: &Path) -> String {
+    format!("/D /S /C \"{editor} \"{}\"\"", path.display())
+}
+
 fn edit(path: &Path, out: &mut dyn Write) -> Result<()> {
     if path.is_dir() {
         bail!("{} is a directory, not a config file", path.display());
@@ -523,23 +566,9 @@ fn edit(path: &Path, out: &mut dyn Write) -> Result<()> {
         fs::write(path, TEMPLATE).with_context(|| format!("creating {}", path.display()))?;
     }
     let editor = editor();
-    // The editor may carry arguments (`code --wait`), so let a shell split it.
-    let status = if cfg!(windows) {
-        let mut parts = editor.split_whitespace();
-        let program = parts.next().unwrap_or("notepad");
-        std::process::Command::new(program)
-            .args(parts)
-            .arg(path)
-            .status()
-    } else {
-        std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("{editor} \"$1\""))
-            .arg("sh")
-            .arg(path)
-            .status()
-    }
-    .with_context(|| format!("starting the editor `{editor}` (set VISUAL or EDITOR)"))?;
+    let status = editor_command(&editor, path)
+        .status()
+        .with_context(|| format!("starting the editor `{editor}` (set VISUAL or EDITOR)"))?;
     if !status.success() {
         bail!("the editor `{editor}` exited with {status}");
     }
@@ -745,6 +774,34 @@ mod tests {
     }
 
     #[test]
+    fn set_refuses_to_save_into_an_invalid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "margin = 3\n").unwrap();
+        let err = run_err(&path, set_action("profile", &["scribe"]));
+        assert!(err.contains("not saved"), "{err}");
+        assert!(err.contains("margin"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "margin = 3\n");
+        // Setting the broken key itself fixes the file.
+        run_ok(&path, set_action("margin", &["wide"]));
+        run_ok(&path, set_action("profile", &["scribe"]));
+        assert_eq!(get(&path, "margin"), "wide");
+        assert_eq!(get(&path, "profile"), "scribe");
+    }
+
+    #[test]
+    fn windows_editor_line_keeps_quotes() {
+        let line = windows_editor_line(
+            r#""C:\Program Files\Notepad++\notepad++.exe" -multiInst"#,
+            Path::new(r"C:\Users\A B\config.toml"),
+        );
+        assert_eq!(
+            line,
+            r#"/D /S /C ""C:\Program Files\Notepad++\notepad++.exe" -multiInst "C:\Users\A B\config.toml"""#
+        );
+    }
+
+    #[test]
     fn reset_reports_the_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -797,6 +854,11 @@ mod tests {
         assert_eq!(find(&builtin, "profile"), "generic");
         assert_eq!(find(&builtin, "svg"), "keep");
         assert_eq!(find(&builtin, "grayscale"), "off");
+        assert_eq!(
+            find(&builtin, "lang"),
+            "the first HTML input's <html lang>, else en"
+        );
+        assert!(find(&builtin, "link_root").contains("git"));
         assert!(find(&builtin, "output").contains("current directory"));
         let user = UserConfig::from_toml_str(
             "profile = \"scribe\"\ngrayscale = true\noutput-location = \"input\"\n",

@@ -240,7 +240,8 @@ pub fn build_book(
         ctx.warn(n);
     }
     let mut chapters = Vec::new();
-    let mut follower = linked::Follower::new(inputs, ctx.opts.follow_links);
+    let scope = linked::LinkScope::new(inputs, ctx.opts.link_root.as_deref())?;
+    let mut follower = linked::Follower::new(inputs, ctx.opts.follow_links, scope);
     for (i, input) in inputs.iter().enumerate() {
         let first = first_rendered.take().filter(|_| i == 0);
         let input_chapters = convert_document(input, first, &mut ctx)?;
@@ -249,7 +250,12 @@ pub fn build_book(
     }
     add_linked_files(&mut follower, &mut chapters, &mut ctx);
     let resource_hrefs: Vec<String> = ctx.resources().iter().map(|r| r.href.clone()).collect();
-    for w in html::fix_links_full(&mut chapters, &resource_hrefs, follower.skipped()) {
+    for w in html::fix_links_full(
+        &mut chapters,
+        &resource_hrefs,
+        follower.skipped(),
+        Some(follower.scope().root()),
+    ) {
         ctx.warn(w);
     }
     let chapters = notes::insert(chapters, &mut ctx)?;
@@ -353,7 +359,9 @@ fn add_linked_files(follower: &mut linked::Follower, chapters: &mut Vec<Chapter>
         }
         ctx.info(format!("adding linked file {}", path.display()));
         match convert_document(&path, None, ctx) {
-            Ok(new) => {
+            Ok(mut new) => {
+                let name = follower.scope().display_name(&path);
+                give_toc_entry(&mut new, &name);
                 follower.scan(&new, ctx);
                 chapters.extend(new);
             }
@@ -369,12 +377,13 @@ fn add_linked_files(follower: &mut linked::Follower, chapters: &mut Vec<Chapter>
     let mut toc = Vec::new();
     for (path, kind) in pages {
         ctx.info(format!("adding linked file {}", path.display()));
-        let result = linked::page_html(&path, kind)
+        let name = follower.scope().display_name(&path);
+        let result = linked::page_html(&path, &name, kind)
             .map_err(|e| anyhow!(e))
             .and_then(|html| convert_html(&html, &path, ctx));
         match result {
             Ok(new) if !new.is_empty() => {
-                toc.push((new[0].file_name.clone(), linked::display_name(&path)));
+                toc.push((new[0].file_name.clone(), name));
                 page_chapters.extend(new);
             }
             Ok(_) => follower.skip(&path, "nothing to show".into()),
@@ -399,6 +408,30 @@ fn add_linked_files(follower: &mut linked::Follower, chapters: &mut Vec<Chapter>
         source: None,
     });
     chapters.extend(page_chapters);
+}
+
+/// Makes sure a linked document has a top-level table of contents entry:
+/// when its first chapter does not start with a level-1 heading (a
+/// changelog with only `##` sections), that chapter gets a level-1 entry
+/// named `name` (the file's display name), and the document's own headings
+/// nest under it instead of under the previous chapter.
+fn give_toc_entry(chapters: &mut [Chapter], name: &str) {
+    let Some(first) = chapters.first_mut() else {
+        return;
+    };
+    if first.headings.first().is_some_and(|h| h.level == 1) {
+        return;
+    }
+    first.title = name.to_string();
+    first.headings.insert(
+        0,
+        Heading {
+            level: 1,
+            text: name.to_string(),
+            id: String::new(),
+        },
+    );
+    first.in_toc = true;
 }
 
 /// Reads an input file as text (see [`decode_text`]). The second value is a
@@ -620,6 +653,36 @@ mod tests {
         let report = run_on_this_thread(&cli, &user).unwrap();
         assert_eq!(report.output, sub.join("d.epub"));
         assert!(report.output.is_file());
+    }
+
+    #[test]
+    fn linked_documents_without_h1_get_a_toc_entry() {
+        let heading = |level, text: &str| Heading {
+            level,
+            text: text.into(),
+            id: text.into(),
+        };
+        let mut chapters = vec![Chapter {
+            title: "v1.1.0".into(),
+            headings: vec![heading(2, "v1.1.0"), heading(2, "v1.0.0")],
+            in_toc: true,
+            ..Chapter::default()
+        }];
+        give_toc_entry(&mut chapters, "CHANGELOG.md");
+        assert_eq!(chapters[0].title, "CHANGELOG.md");
+        assert_eq!(chapters[0].headings.len(), 3);
+        assert_eq!(chapters[0].headings[0].level, 1);
+        assert_eq!(chapters[0].headings[0].text, "CHANGELOG.md");
+        // A document that starts with an h1 is left alone.
+        let mut with_h1 = vec![Chapter {
+            title: "Guide".into(),
+            headings: vec![heading(1, "Guide")],
+            ..Chapter::default()
+        }];
+        let before = with_h1.clone();
+        give_toc_entry(&mut with_h1, "guide.md");
+        assert_eq!(with_h1, before);
+        give_toc_entry(&mut [], "x.md");
     }
 
     #[test]

@@ -93,7 +93,7 @@ self-closed `<div/>`).
 | `--profile <NAME>` | `scribe`, `remarkable`, `remarkable-pro`, `generic` | `generic` | Target device (see below). |
 | `--title <TITLE>` | text | front matter, then first `<h1>`, then file name | Book title. |
 | `--author <NAME>` | text, repeatable | front matter | Author(s). |
-| `--lang <LANG>` | BCP 47 tag | first HTML input's `<html lang>`, else `en` | Book language. `en_US` is normalized to `en-US`; an invalid tag falls back to `en` with a warning. |
+| `--lang <LANG>` | BCP 47 tag | first HTML input's `<html lang>`, else `en` | Book language. `en_US` is normalized to `en-US`; an invalid tag falls back to `en` with a warning. A `lang` set with `md2epub config` replaces `en` here, but an HTML input's `<html lang>` still wins over it. |
 | `--cover <IMG>` | PNG, JPEG, SVG, WebP, ... | generated title page | Cover image (must exist). |
 | `--split-level <L>` | `1`, `2`, `none` | `1` | Start a new chapter (file) at each heading of this level. Each input file always starts a chapter. |
 | `--notes <WHERE>` | `none`, `after-chapter`, `end` | `none` | Insert full-page note pages. |
@@ -108,6 +108,7 @@ self-closed `<div/>`).
 | `--offline` | flag | off | Do not download remote images (their alt text is kept). `--no-offline` turns it off. |
 | `-v, --verbose` | flag | off | Print progress and detailed diagnostics. `--no-verbose` turns it off. |
 | `--follow-links` | flag | on | Add linked local files to the book (see below). `--no-follow-links` turns it off. |
+| `--link-root <DIR>` | directory | git work tree of the inputs, else their common folder | Follow links only to files inside this folder; links that start with `/` resolve against it (see below). |
 
 The defaults above are the built-in ones. `md2epub --help` shows the defaults that
 actually apply, in bold on a terminal, including your own (see
@@ -180,6 +181,7 @@ grayscale = false
 css = "extra.css"
 offline = true
 follow-links = true
+link-root = ".."          # optional, see "Linked local files"
 ```
 
 Flags given on the command line still win: `md2epub build book.toml --profile remarkable -o rm.epub`.
@@ -224,19 +226,34 @@ flags still win. A `profile` you set also changes the profile-derived defaults (
 and an `svg` or `math` value you set yourself applies under every profile.
 If the file has a mistake, conversions stop with an error that names the file and the
 key. `md2epub config edit`, `config path` and `config reset` still work, and so does
-`config unset` as long as the file is valid TOML. `--help` then shows the built-in
-defaults.
+`config unset` as long as the file is valid TOML, while `config set` refuses to save
+until the file is valid again (setting the broken key itself is fine). `--help` then
+shows the built-in defaults. A `css` file from your defaults that no longer exists stops
+conversions with an error that names the config file; `md2epub config unset css`
+removes it.
 
-`config` is a subcommand name, so a file literally named `config` must be written as
-`./config` (the same goes for `build`).
+`config` and `build` are subcommand names. Inputs always need a `.md` or `.html`
+extension, so a file named `config` or `build` cannot be an input; rename it (for example
+to `config.md`).
 
 ### Linked local files
 
 Links to local files (`[diagram](docs/flow.svg)`, `<a href="../NOTES.md#setup">`,
 `file:///...`) are followed: each linked file that exists is added to the book once,
 after the inputs, in the order it is first linked (breadth-first), and the link is
-rewritten to point to it. Paths are relative to the linking file; `%20` escapes are
-decoded and `?query` parts are ignored.
+rewritten to point to it. Paths are relative to the linking file (relative `file:` URLs
+such as `file:notes.md` too); `%20` escapes are decoded and `?query` parts are ignored.
+A link that starts with `/` (`/docs/guide.md`, as on GitHub) is relative to the project
+folder. A path written with backslashes (`docs\guide.md`) is also tried with `/`, and a
+link to a missing `guide.html` finds `guide.md` beside it.
+
+Only files inside the **project folder** are added: the `--link-root` folder if you give
+one (`link-root` in `book.toml`), otherwise the git work tree that holds the inputs (the
+nearest folder with `.git`), otherwise the folder that holds all the inputs. Hidden files
+and files in hidden folders (names starting with `.`, such as `.env` or `.ssh/`) are
+never added. A linked file from outside the inputs' own folder (for example
+`../README.md` inside the git work tree) is added with a warning, so you always see when
+a file from elsewhere ends up in the book.
 
 | Linked file | Added as |
 |---|---|
@@ -246,9 +263,13 @@ decoded and `?query` parts are ignored.
 | Other UTF-8 text files up to 1 MB | A page with the file name and the contents as a code block, highlighted by file extension. |
 
 Pages for files other than documents are grouped in the table of contents under a final
-**Linked files** section. Links to files that cannot be added keep their text but lose the
-link, with a warning that says why (the file does not exist, is a directory, is binary or
-is larger than 1 MB). Links to a file that is also an input go to that input's chapter.
+**Linked files** section, named by their path relative to the inputs' folder
+(`a/mod.rs`, `b/mod.rs`). A linked document that does not start with a level-1 heading
+(a changelog with only `##` sections) gets its own top-level entry, named after the file,
+with its headings under it. Links to files that cannot be added keep their text but lose
+the link, with one warning per file and reason that quotes the link as you wrote it (the
+file does not exist, is a directory, is binary, is larger than 1 MB, is outside the
+project folder or is hidden). Links to a file that is also an input go to that input's chapter.
 At most 500 linked files are added. Web links, `mailto:` links and links inside the book
 are not affected. Use `--no-follow-links` (or `follow-links = false` in `book.toml`, or
 `md2epub config set follow-links false` to make it your default) to only convert the
@@ -326,7 +347,8 @@ cargo build --release --no-default-features --features mermaid
 - **Very large or deeply nested input** is refused: images over 100 megapixels are not
   embedded, and documents nested more than 2000 elements deep stop with an error. A
   formula or SVG that takes too long to render (20 s and 30 s) is skipped with a warning.
-- **JavaScript** in HTML inputs is removed. Pages that build their content with JavaScript
+- **JavaScript** in HTML inputs is removed, and so are scripts and event handlers in SVG
+  images that are kept as SVG. Pages that build their content with JavaScript
   convert to whatever static HTML they contain.
 - **Remote images** are fetched with a 20 s timeout and a 50 MB cap. With `--offline` they
   are skipped and their alt text is kept.

@@ -52,6 +52,7 @@
 //! offline = true
 //! verbose = false
 //! follow-links = true               # add linked local files
+//! link-root = ".."                  # follow links to files under this folder
 //! output-location = "cwd"           # or "input"; used when there is no output
 //! ```
 //!
@@ -115,6 +116,7 @@ const TOML_KEYS: &[&str] = &[
     "verbose",
     "output-location",
     "follow-links",
+    "link-root",
 ];
 
 /// Keys accepted in the user config, in `md2epub config list` order.
@@ -175,6 +177,8 @@ pub struct UserConfig {
     layer: Layer,
     /// Canonical keys present in the file, in file order.
     keys: Vec<String>,
+    /// The file it was loaded from, for error messages.
+    path: Option<PathBuf>,
 }
 
 impl UserConfig {
@@ -190,7 +194,11 @@ impl UserConfig {
                 keys.push(k);
             }
         }
-        Ok(UserConfig { layer, keys })
+        Ok(UserConfig {
+            layer,
+            keys,
+            path: None,
+        })
     }
 
     /// Reads the user config at `path`; a missing file is an empty config.
@@ -205,12 +213,14 @@ impl UserConfig {
                 return Err(e).with_context(|| format!("reading user config {}", path.display()));
             }
         };
-        UserConfig::from_toml_str(&text, &parent_dir(path)).with_context(|| {
+        let mut user = UserConfig::from_toml_str(&text, &parent_dir(path)).with_context(|| {
             format!(
                 "in user config {} (fix it with `md2epub config edit`, or remove it with `md2epub config reset`)",
                 path.display()
             )
-        })
+        })?;
+        user.path = Some(path.to_path_buf());
+        Ok(user)
     }
 
     /// Whether the file sets `key` (canonical spelling, see [`USER_KEYS`]).
@@ -284,9 +294,26 @@ pub fn resolve_with(
             .with_context(|| format!("front matter of {}", inputs[0].display()))?;
         merged = merged.over(fm_layer);
     }
+    // A language from the user config is only a fallback: the first HTML
+    // input's `<html lang>` still wins over it.
+    let lang_given = merged.lang.as_deref().is_some_and(|l| !l.trim().is_empty());
+    if merged.css.is_none()
+        && let Some(css) = &user.layer.css
+        && !css.is_file()
+    {
+        let file = user.path.as_ref().map_or_else(
+            || "your user config".into(),
+            |p| format!("your user config {}", p.display()),
+        );
+        bail!(
+            "CSS file not found: {} (set as `css` in {file}; change it with `md2epub config set css <file>` or remove it with `md2epub config unset css`)",
+            css.display()
+        );
+    }
     merged = merged.over(user.layer.clone());
 
-    let opts = merged.into_options()?;
+    let mut opts = merged.into_options()?;
+    opts.lang_given = lang_given;
     Ok((opts, inputs))
 }
 
@@ -417,6 +444,8 @@ struct Layer {
     output_location: Option<OutputLocation>,
     /// Linked local files (`--follow-links`, `follow-links`).
     follow_links: Option<bool>,
+    /// `--link-root`, `link-root`.
+    link_root: Option<PathBuf>,
 }
 
 impl Layer {
@@ -459,6 +488,7 @@ impl Layer {
             verbose: switch(f.verbose, f.no_verbose),
             output_location: f.output_location,
             follow_links: switch(f.follow_links, f.no_follow_links),
+            link_root: f.link_root.clone(),
         })
     }
 
@@ -573,6 +603,9 @@ impl Layer {
                 "output-location" => l.output_location = Some(toml_parse(value).with_context(ctx)?),
                 // --- Linked local files ---
                 "follow-links" => l.follow_links = Some(toml_bool(value).with_context(ctx)?),
+                "link-root" => {
+                    l.link_root = Some(rel_to(base, &toml_string(value).with_context(ctx)?))
+                }
                 _ => bail!(
                     "unknown key `{raw_key}`: expected one of {}",
                     TOML_KEYS.join(", ")
@@ -656,6 +689,7 @@ impl Layer {
             verbose: self.verbose.or(lower.verbose),
             output_location: self.output_location.or(lower.output_location),
             follow_links: self.follow_links.or(lower.follow_links),
+            link_root: self.link_root.or(lower.link_root),
         }
     }
 
@@ -697,6 +731,7 @@ impl Layer {
             output_location: self.output_location.unwrap_or(d.output_location),
             lang_given,
             follow_links: self.follow_links.unwrap_or(d.follow_links),
+            link_root: self.link_root,
         })
     }
 }
@@ -1665,6 +1700,35 @@ mod tests {
     }
 
     #[test]
+    fn missing_user_css_names_the_user_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "css = \"missing.css\"\n").unwrap();
+        let u = UserConfig::load(&cfg).unwrap();
+        let md = path_str(&fixture("kitchen-sink.md"));
+        let err = err_of(resolve_with(&cli(&[&md]), None, &u));
+        assert!(err.contains("missing.css"), "{err}");
+        assert!(err.contains("config.toml"), "{err}");
+        assert!(err.contains("md2epub config unset css"), "{err}");
+        // A --css flag replaces it, so the missing default does not matter.
+        let css = path_str(&fixture("extra.css"));
+        let (o, _) = resolve_with(&cli(&[&md, "--css", &css]), None, &u).unwrap();
+        assert_eq!(o.extra_css, Some(PathBuf::from(css)));
+    }
+
+    #[test]
+    fn link_root_from_flags_and_toml() {
+        let md = path_str(&fixture("kitchen-sink.md"));
+        let (o, _) = resolve(&cli(&[&md]), None).unwrap();
+        assert_eq!(o.link_root, None);
+        let (o, _) = resolve(&cli(&[&md, "--link-root", "/x"]), None).unwrap();
+        assert_eq!(o.link_root, Some(PathBuf::from("/x")));
+        let (dir, book) = book_dir("inputs = [\"a.md\"]\nlink-root = \"..\"\n");
+        let (o, _) = resolve(&cli(&["build", &path_str(&book)]), None).unwrap();
+        assert_eq!(o.link_root, Some(dir.path().join("..")));
+    }
+
+    #[test]
     fn user_config_sits_below_front_matter_toml_and_flags() {
         let u = user(
             "profile = \"scribe\"\nauthor = \"User\"\nlang = \"de\"\nnotes = \"end\"\nmargin = \"wide\"\ngrayscale = true\noutput-location = \"input\"\n",
@@ -1677,7 +1741,8 @@ mod tests {
         assert_eq!(o.svg, SvgMode::Rasterize);
         assert_eq!(o.meta.authors, vec!["User"]);
         assert_eq!(o.meta.lang, "de");
-        assert!(o.lang_given);
+        // ... but a user language is only a fallback for `<html lang>`.
+        assert!(!o.lang_given);
         assert_eq!(o.notes, NotesPlacement::End);
         assert_eq!(o.margin, Margin::Wide);
         assert!(o.grayscale);

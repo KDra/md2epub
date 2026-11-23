@@ -20,9 +20,18 @@
 //! directories, binary, too large, over [`MAX_LINKED_FILES`]) are recorded
 //! with the reason, and `html::fix_links_full` removes links to them with a
 //! warning that says why.
+//!
+//! Only files inside the project root ([`LinkScope`]) are followed: the
+//! `--link-root` directory, else the git work tree that holds the inputs,
+//! else the inputs' common directory. Hidden files and files in hidden
+//! directories (a name starting with `.`, below the root) are never added.
+//! Root-relative links (`/docs/a.md`) resolve against the same root. A
+//! followed file outside the inputs' directory is added with a warning.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Result, bail};
 
 use crate::ctx::Ctx;
 use crate::html::{link_base, link_hrefs, local_link_target, source_key};
@@ -114,10 +123,130 @@ fn is_text(bytes: &[u8]) -> bool {
     !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
 }
 
+/// Where linked files may come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkScope {
+    /// Canonical project root: links are followed only to files under it,
+    /// and root-relative links resolve against it.
+    root: PathBuf,
+    /// Canonical common directory of the inputs.
+    inputs_dir: PathBuf,
+}
+
+impl LinkScope {
+    /// The scope for `inputs`: `link_root` when given (it must be an
+    /// existing directory), else the nearest directory at or above the
+    /// inputs' common directory that holds `.git`, else that common
+    /// directory.
+    pub fn new(inputs: &[PathBuf], link_root: Option<&Path>) -> Result<LinkScope> {
+        let inputs_dir = common_dir(inputs);
+        let root = match link_root {
+            Some(dir) => {
+                if !dir.is_dir() {
+                    bail!("link root '{}' is not an existing directory", dir.display());
+                }
+                source_key(dir)
+            }
+            None => inputs_dir
+                .ancestors()
+                .find(|d| d.join(".git").exists())
+                .unwrap_or(&inputs_dir)
+                .to_path_buf(),
+        };
+        Ok(LinkScope { root, inputs_dir })
+    }
+
+    /// The project root.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Why the existing file with source key `key` may not be added, if it
+    /// may not.
+    fn refuse(&self, key: &Path) -> Option<String> {
+        let Ok(rel) = key.strip_prefix(&self.root) else {
+            return Some(format!(
+                "it is outside the project folder {} (use --link-root to follow links to another folder)",
+                self.root.display()
+            ));
+        };
+        let hidden = rel.components().any(|c| match c {
+            Component::Normal(n) => n.to_string_lossy().starts_with('.'),
+            _ => false,
+        });
+        hidden.then(|| {
+            "it is a hidden file or inside a hidden folder (names starting with '.' are never added)"
+                .to_string()
+        })
+    }
+
+    /// Name of a linked file for headings and the table of contents: its
+    /// path relative to the inputs' directory (`docs/guide.md`), else
+    /// relative to the project root, else its file name.
+    pub fn display_name(&self, path: &Path) -> String {
+        let key = source_key(path);
+        let rel = key
+            .strip_prefix(&self.inputs_dir)
+            .or_else(|_| key.strip_prefix(&self.root))
+            .ok()
+            .filter(|r| !r.as_os_str().is_empty());
+        match rel {
+            Some(rel) => rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+            None => file_name(path),
+        }
+    }
+}
+
+/// Canonical common directory of the inputs' parent directories.
+fn common_dir(inputs: &[PathBuf]) -> PathBuf {
+    let mut common: Option<PathBuf> = None;
+    for input in inputs {
+        let dir = source_key(input)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        common = Some(match common {
+            None => dir,
+            Some(c) => {
+                let mut out = PathBuf::new();
+                for (a, b) in c.components().zip(dir.components()) {
+                    if a != b {
+                        break;
+                    }
+                    out.push(a.as_os_str());
+                }
+                out
+            }
+        });
+    }
+    common.unwrap_or_else(|| source_key(Path::new(".")))
+}
+
+/// The existing document with the same stem and another document
+/// extension, for a link to a missing document (`a.html` -> `a.md`), in the
+/// order `html::fix_links` prefers (sorted by extension).
+fn sibling_document(target: &Path) -> Option<PathBuf> {
+    let ext = extension(target);
+    if !DOCUMENT_EXTS.contains(&ext.as_str()) {
+        return None;
+    }
+    let mut exts: Vec<&str> = DOCUMENT_EXTS.to_vec();
+    exts.sort_unstable();
+    exts.into_iter()
+        .filter(|e| *e != ext)
+        .map(|e| target.with_extension(e))
+        .find(|p| p.is_file())
+}
+
 /// Breadth-first discovery of linked files.
 #[derive(Debug)]
 pub struct Follower {
     enabled: bool,
+    scope: LinkScope,
     /// Source keys of the inputs and of every file queued so far.
     known: HashSet<PathBuf>,
     /// Source key -> why the file was not added.
@@ -129,10 +258,12 @@ pub struct Follower {
 
 impl Follower {
     /// A follower that knows the explicit `inputs` (links to them are left
-    /// to `html::fix_links`). When `enabled` is false nothing is queued.
-    pub fn new(inputs: &[PathBuf], enabled: bool) -> Self {
+    /// to `html::fix_links`) and follows links only within `scope`. When
+    /// `enabled` is false nothing is queued.
+    pub fn new(inputs: &[PathBuf], enabled: bool, scope: LinkScope) -> Self {
         Follower {
             enabled,
+            scope,
             known: inputs.iter().map(|p| source_key(p)).collect(),
             skipped: HashMap::new(),
             queue: VecDeque::new(),
@@ -143,11 +274,12 @@ impl Follower {
 
     /// Queues every new local file linked from `chapters`, in link order.
     pub fn scan(&mut self, chapters: &[Chapter], ctx: &mut Ctx) {
+        let root = self.scope.root.clone();
         for ch in chapters {
             let Some(source) = &ch.source else { continue };
             let base = link_base(source);
             for href in link_hrefs(&ch.body_xhtml) {
-                let Some(target) = local_link_target(&base, &href) else {
+                let Some(target) = local_link_target(&base, Some(&root), &href) else {
                     continue;
                 };
                 self.consider(target, ctx);
@@ -156,17 +288,19 @@ impl Follower {
     }
 
     fn consider(&mut self, target: PathBuf, ctx: &mut Ctx) {
+        let target = match target.exists() {
+            true => target,
+            false => sibling_document(&target).unwrap_or(target),
+        };
         let key = source_key(&target);
         if self.known.contains(&key) || self.skipped.contains_key(&key) {
             return;
         }
-        if !self.enabled {
-            if target.exists() {
-                self.skipped.insert(
-                    key,
-                    "following linked files is turned off by --no-follow-links or follow-links = false".into(),
-                );
-            }
+        // Confinement first, so nothing outside the root is even read.
+        if target.exists()
+            && let Some(reason) = self.scope.refuse(&key)
+        {
+            self.skipped.insert(key, reason);
             return;
         }
         let kind = match classify(&target) {
@@ -176,6 +310,14 @@ impl Follower {
                 return;
             }
         };
+        if !self.enabled {
+            self.skipped.insert(
+                key,
+                "following linked files is turned off by --no-follow-links or follow-links = false"
+                    .into(),
+            );
+            return;
+        }
         if self.followed >= MAX_LINKED_FILES {
             if !self.limit_warned {
                 self.limit_warned = true;
@@ -189,9 +331,21 @@ impl Follower {
             );
             return;
         }
+        if key.strip_prefix(&self.scope.inputs_dir).is_err() {
+            ctx.warn(format!(
+                "adding linked file {}, which is outside the inputs' folder {}",
+                key.display(),
+                self.scope.inputs_dir.display()
+            ));
+        }
         self.followed += 1;
         self.known.insert(key);
         self.queue.push_back((target, kind));
+    }
+
+    /// Where linked files may come from.
+    pub fn scope(&self) -> &LinkScope {
+        &self.scope
     }
 
     /// The next file to add, in breadth-first order.
@@ -210,8 +364,8 @@ impl Follower {
     }
 }
 
-/// Display name of a linked file (its file name).
-pub fn display_name(path: &Path) -> String {
+/// File name of a path (the whole path when it has none).
+pub fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
@@ -230,18 +384,19 @@ fn encode_component(name: &str) -> String {
     out
 }
 
-/// HTML for the page of a non-document linked file: an `<h2>` with the file
-/// name (it nests under the "Linked files" section) and the content.
-pub fn page_html(path: &Path, kind: LinkedKind) -> Result<String, String> {
-    let name = display_name(path);
-    let mut html = format!("<h2>{}</h2>\n", crate::dom::escape(&name));
+/// HTML for the page of a non-document linked file: an `<h2>` with `name`
+/// (see [`LinkScope::display_name`]; it nests under the "Linked files"
+/// section) and the content.
+pub fn page_html(path: &Path, name: &str, kind: LinkedKind) -> Result<String, String> {
+    let mut html = format!("<h2>{}</h2>\n", crate::dom::escape(name));
     match kind {
         LinkedKind::Document => return Err("not a page".into()),
         LinkedKind::Image => {
+            let file = file_name(path);
             html.push_str(&format!(
                 "<figure class=\"linked-file\"><img src=\"{}\" alt=\"{}\"/></figure>\n",
-                encode_component(&name),
-                crate::dom::escape(&name)
+                encode_component(&file),
+                crate::dom::escape(name)
             ));
         }
         LinkedKind::Mermaid | LinkedKind::Text => {
@@ -268,7 +423,7 @@ fn language_of(path: &Path) -> String {
     if !ext.is_empty() {
         return ext;
     }
-    display_name(path).to_ascii_lowercase()
+    file_name(path).to_ascii_lowercase()
 }
 
 /// Body of the "Linked files" section chapter: a heading with `id` and a
@@ -294,8 +449,31 @@ mod tests {
 
     fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let p = dir.join(name);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
         std::fs::write(&p, bytes).unwrap();
         p
+    }
+
+    fn follower(input: &Path, enabled: bool) -> Follower {
+        let inputs = [input.to_path_buf()];
+        Follower::new(&inputs, enabled, LinkScope::new(&inputs, None).unwrap())
+    }
+
+    fn scan(f: &mut Follower, input: &Path, body: &str, ctx: &mut Ctx) {
+        let ch = Chapter {
+            source: Some(input.to_path_buf()),
+            body_xhtml: body.into(),
+            ..Chapter::default()
+        };
+        f.scan(&[ch], ctx);
+    }
+
+    fn queued(f: &mut Follower) -> Vec<String> {
+        std::iter::from_fn(|| f.next_file())
+            .map(|(p, _)| file_name(&p))
+            .collect()
     }
 
     #[test]
@@ -343,7 +521,7 @@ mod tests {
         write(d, "b.md", b"");
         write(d, "c.txt", b"x");
         let mut ctx = Ctx::new(Options::default());
-        let mut f = Follower::new(std::slice::from_ref(&input), true);
+        let mut f = follower(&input, true);
         let ch = Chapter {
             source: Some(input.clone()),
             body_xhtml: concat!(
@@ -356,10 +534,10 @@ mod tests {
         };
         f.scan(std::slice::from_ref(&ch), &mut ctx);
         let (p1, k1) = f.next_file().unwrap();
-        assert_eq!(display_name(&p1), "c.txt");
+        assert_eq!(file_name(&p1), "c.txt");
         assert_eq!(k1, LinkedKind::Text);
         let (p2, k2) = f.next_file().unwrap();
-        assert_eq!(display_name(&p2), "b.md");
+        assert_eq!(file_name(&p2), "b.md");
         assert_eq!(k2, LinkedKind::Document);
         assert!(f.next_file().is_none());
         // Scanning again adds nothing.
@@ -377,7 +555,7 @@ mod tests {
         let input = write(d, "in.md", b"");
         write(d, "b.md", b"");
         let mut ctx = Ctx::new(Options::default());
-        let mut f = Follower::new(std::slice::from_ref(&input), false);
+        let mut f = follower(&input, false);
         let ch = Chapter {
             source: Some(input),
             body_xhtml: r#"<a href="b.md">b</a>"#.into(),
@@ -387,6 +565,123 @@ mod tests {
         assert!(f.next_file().is_none());
         let reason = f.skipped().values().next().unwrap();
         assert!(reason.contains("turned off"), "{reason}");
+    }
+
+    #[test]
+    fn disabled_follower_keeps_the_real_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let input = write(d, "in.md", b"");
+        write(d, "docs/guide.md", b"# G");
+        let mut ctx = Ctx::new(Options::default());
+        let mut f = follower(&input, false);
+        scan(
+            &mut f,
+            &input,
+            r#"<a href="docs/">d</a><a href="docs/guide.md#s">1</a><a href="./docs/../docs/guide.md">2</a>"#,
+            &mut ctx,
+        );
+        let mut reasons: Vec<&String> = f.skipped().values().collect();
+        reasons.sort();
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons[0].contains("following linked files is turned off"));
+        assert!(reasons[1].contains("directory"), "{reasons:?}");
+    }
+
+    #[test]
+    fn links_outside_the_root_and_hidden_files_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let input = write(d, "proj/notes.md", b"");
+        write(d, "secret/.ssh/id_ed25519", b"PRIVATE KEY");
+        write(d, "secret/plain.txt", b"secret");
+        write(d, "proj/.env", b"TOKEN=1");
+        write(d, "proj/.github/x.md", b"# X");
+        write(d, "proj/ok.txt", b"ok");
+        let abs = d.join("secret/plain.txt");
+        let mut ctx = Ctx::new(Options::default());
+        let mut f = follower(&input, true);
+        scan(
+            &mut f,
+            &input,
+            &format!(
+                r#"<a href="../secret/.ssh/id_ed25519">k</a><a href="{}">a</a><a href=".env">e</a><a href=".github/x.md">g</a><a href="ok.txt">o</a>"#,
+                abs.display()
+            ),
+            &mut ctx,
+        );
+        assert_eq!(queued(&mut f), ["ok.txt"]);
+        let reasons: Vec<&String> = f.skipped().values().collect();
+        assert_eq!(reasons.len(), 4, "{reasons:?}");
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|r| r.contains("outside the project folder"))
+                .count(),
+            2,
+            "{reasons:?}"
+        );
+        assert_eq!(
+            reasons.iter().filter(|r| r.contains("hidden")).count(),
+            2,
+            "{reasons:?}"
+        );
+        assert!(ctx.warnings().is_empty(), "{:?}", ctx.warnings());
+
+        // A wider root lets the outside file in, with a warning; hidden
+        // files stay out.
+        let inputs = [input.clone()];
+        let scope = LinkScope::new(&inputs, Some(d)).unwrap();
+        let mut f = Follower::new(&inputs, true, scope);
+        scan(
+            &mut f,
+            &input,
+            r#"<a href="../secret/plain.txt">p</a><a href="../secret/.ssh/id_ed25519">k</a>"#,
+            &mut ctx,
+        );
+        assert_eq!(queued(&mut f), ["plain.txt"]);
+        assert_eq!(ctx.warnings().len(), 1, "{:?}", ctx.warnings());
+        assert!(ctx.warnings()[0].contains("outside the inputs' folder"));
+        assert!(LinkScope::new(&inputs, Some(&d.join("nope"))).is_err());
+    }
+
+    #[test]
+    fn git_work_tree_is_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::create_dir(d.join(".git")).unwrap();
+        let input = write(d, "docs/in.md", b"");
+        write(d, "README.md", b"# R");
+        write(d, "docs/guide.md", b"# G");
+        let inputs = [input.clone()];
+        let scope = LinkScope::new(&inputs, None).unwrap();
+        assert_eq!(scope.root(), source_key(d));
+        assert_eq!(scope.display_name(&d.join("docs/guide.md")), "guide.md");
+        assert_eq!(scope.display_name(&d.join("README.md")), "README.md");
+        let mut ctx = Ctx::new(Options::default());
+        let mut f = Follower::new(&inputs, true, scope);
+        scan(
+            &mut f,
+            &input,
+            r#"<a href="/README.md">r</a><a href="guide.html">g</a>"#,
+            &mut ctx,
+        );
+        // Root-relative links resolve in the work tree, and a link to a
+        // missing .html finds the .md beside it.
+        assert_eq!(queued(&mut f), ["README.md", "guide.md"]);
+        assert!(f.skipped().is_empty(), "{:?}", f.skipped());
+    }
+
+    #[test]
+    fn display_names_are_relative_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let input = write(d, "in.md", b"");
+        let a = write(d, "a/mod.rs", b"");
+        let b = write(d, "b/mod.rs", b"");
+        let scope = LinkScope::new(&[input], None).unwrap();
+        assert_eq!(scope.display_name(&a), "a/mod.rs");
+        assert_eq!(scope.display_name(&b), "b/mod.rs");
     }
 
     #[test]
@@ -400,7 +695,7 @@ mod tests {
             body.push_str(&format!("<a href=\"f{i}.txt\">x</a>"));
         }
         let mut ctx = Ctx::new(Options::default());
-        let mut f = Follower::new(std::slice::from_ref(&input), true);
+        let mut f = follower(&input, true);
         let ch = Chapter {
             source: Some(input),
             body_xhtml: body,
@@ -422,25 +717,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         let img = write(d, "my pic#1.png", b"x");
-        let html = page_html(&img, LinkedKind::Image).unwrap();
-        assert!(html.contains("<h2>my pic#1.png</h2>"), "{html}");
+        let html = page_html(&img, "pics/my pic#1.png", LinkedKind::Image).unwrap();
+        assert!(html.contains("<h2>pics/my pic#1.png</h2>"), "{html}");
         assert!(html.contains("src=\"my%20pic%231.png\""), "{html}");
         let code = write(
             d,
             "main.rs",
             "\u{feff}fn main() { let a = 1 < 2; }".as_bytes(),
         );
-        let html = page_html(&code, LinkedKind::Text).unwrap();
+        let html = page_html(&code, "main.rs", LinkedKind::Text).unwrap();
         assert!(html.contains("language-rs"), "{html}");
         assert!(html.contains("&lt;"), "{html}");
         assert!(!html.contains('\u{feff}'));
         let mmd = write(d, "g.mmd", b"graph TD\n A-->B");
-        let html = page_html(&mmd, LinkedKind::Mermaid).unwrap();
+        let html = page_html(&mmd, "g.mmd", LinkedKind::Mermaid).unwrap();
         assert!(
             html.contains("<pre class=\"mermaid\">graph TD\n A--&gt;B</pre>"),
             "{html}"
         );
-        assert!(page_html(&mmd, LinkedKind::Document).is_err());
+        assert!(page_html(&mmd, "g.mmd", LinkedKind::Document).is_err());
         let s = section_html("linked-files", &[("ch009.xhtml".into(), "a&b.txt".into())]);
         assert!(s.contains("<h1 id=\"linked-files\">Linked files</h1>"));
         assert!(s.contains("<a href=\"ch009.xhtml\">a&amp;b.txt</a>"));

@@ -118,8 +118,7 @@ pub enum Command {
         long_about = "Show or change your default settings.\n\n\
             Defaults live in a TOML file (`md2epub config path` prints where; the \
             MD2EPUB_CONFIG environment variable overrides the location). They apply to \
-            every conversion; front matter, book.toml and command-line flags still win.\n\n\
-            To convert a file literally named `config`, write it as `./config`.",
+            every conversion; front matter, book.toml and command-line flags still win.",
         after_help = CONFIG_KEYS_HELP
     )]
     Config {
@@ -279,6 +278,10 @@ pub struct Flags {
         overrides_with = "follow_links"
     )]
     pub no_follow_links: bool,
+
+    /// Follow links only to files inside this folder; links starting with `/` resolve against it.
+    #[arg(long = "link-root", global = true, value_name = "DIR")]
+    pub link_root: Option<PathBuf>,
 }
 
 #[cfg(test)]
