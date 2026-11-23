@@ -1,17 +1,373 @@
-/* md2epub base stylesheet (T8 owns the final version). */
+/*
+ * md2epub base stylesheet.
+ *
+ * Written for e-ink readers (Kindle Scribe, reMarkable) and simple EPUB
+ * renderers: black on white, no background colors, no flex/grid, no fixed
+ * positioning and no viewport units. Kindle applies the reader's own margin
+ * and spacing settings, so the values below are hints there.
+ */
+
+/* ---- Page ---------------------------------------------------------- */
+
+html,
 body {
   color: #000;
-  background: #fff;
+  background-color: #fff;
 }
+
+body {
+  margin: 0;
+  padding: 0;
+  line-height: 1.4;
+  widows: 2;
+  orphans: 2;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+/* ---- Text ---------------------------------------------------------- */
+
+p {
+  margin-top: 0;
+  margin-bottom: 0.8em;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  color: #000;
+  font-weight: bold;
+  line-height: 1.2;
+  margin-top: 1.2em;
+  margin-bottom: 0.5em;
+  page-break-after: avoid;
+  break-after: avoid;
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+h1 {
+  font-size: 1.8em;
+  margin-top: 0.6em;
+}
+
+h2 {
+  font-size: 1.45em;
+}
+
+h3 {
+  font-size: 1.2em;
+}
+
+h4 {
+  font-size: 1.05em;
+}
+
+h5,
+h6 {
+  font-size: 1em;
+}
+
+a {
+  color: #000;
+  text-decoration: underline;
+}
+
+strong,
+b {
+  font-weight: bold;
+}
+
+em,
+i {
+  font-style: italic;
+}
+
+del,
+s {
+  text-decoration: line-through;
+}
+
+mark {
+  color: #000;
+  background-color: transparent;
+  font-weight: bold;
+  text-decoration: underline;
+}
+
+small {
+  font-size: 0.85em;
+}
+
+sup,
+sub {
+  font-size: 0.75em;
+  line-height: 0;
+}
+
+blockquote {
+  margin: 1em 0 1em 0.5em;
+  padding: 0 0 0 1em;
+  border-left: 3px solid #000;
+  font-style: italic;
+}
+
+hr {
+  border: 0;
+  border-top: 1px solid #000;
+  margin: 1.5em 0;
+}
+
+ul,
+ol {
+  margin-top: 0;
+  margin-bottom: 0.8em;
+  padding-left: 1.6em;
+}
+
+li {
+  margin-bottom: 0.25em;
+}
+
+li > p {
+  margin-bottom: 0.3em;
+}
+
+dl {
+  margin: 0 0 0.8em 0;
+}
+
+dt {
+  font-weight: bold;
+}
+
+dd {
+  margin: 0 0 0.5em 1.5em;
+}
+
+/* GFM task lists */
+li.task-list-item {
+  list-style-type: none;
+}
+
+li.task-list-item input {
+  margin: 0 0.4em 0 -1.2em;
+}
+
+/* ---- Code ---------------------------------------------------------- */
+
+code,
+kbd,
+samp,
+pre {
+  font-family: monospace;
+}
+
+code,
+kbd,
+samp {
+  font-size: 0.9em;
+}
+
+pre {
+  font-size: 0.8em;
+  line-height: 1.3;
+  margin: 0 0 1em 0;
+  padding: 0.5em 0.6em;
+  border: 1px solid #000;
+  /* Wrap long lines: e-ink readers cannot scroll horizontally. */
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  overflow: visible;
+  page-break-inside: auto;
+}
+
+pre code {
+  font-size: 1em;
+  white-space: pre-wrap;
+}
+
+/* Highlighters may emit inline background colors; drop them on e-ink. */
+pre,
+pre code,
+pre span,
+code {
+  background-color: transparent !important;
+  background-image: none !important;
+}
+
+/* ---- Images and figures ------------------------------------------- */
+
 img {
   max-width: 100%;
   height: auto;
+  page-break-inside: avoid;
+  break-inside: avoid;
 }
-pre {
-  white-space: pre-wrap;
-  word-wrap: break-word;
+
+svg {
+  max-width: 100%;
 }
+
+figure {
+  margin: 1em 0;
+  padding: 0;
+  text-align: center;
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+figure img {
+  display: block;
+  margin: 0 auto;
+}
+
+figcaption {
+  font-size: 0.85em;
+  font-style: italic;
+  text-align: center;
+  margin-top: 0.4em;
+}
+
+figure.mermaid {
+  margin: 1em 0;
+}
+
+/* ---- Tables -------------------------------------------------------- */
+
+table {
+  border-collapse: collapse;
+  border: 1px solid #000;
+  margin: 0 0 1em 0;
+  font-size: 0.85em;
+  max-width: 100%;
+  page-break-inside: auto;
+}
+
+caption {
+  font-style: italic;
+  margin-bottom: 0.3em;
+}
+
+th,
+td {
+  border: 1px solid #000;
+  padding: 0.25em 0.45em;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  font-weight: bold;
+}
+
+tr {
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+thead {
+  display: table-header-group;
+}
+
+/* ---- Footnotes ----------------------------------------------------- */
+
+sup.footnote-ref,
+a.footnote-ref {
+  font-size: 0.75em;
+  line-height: 0;
+  text-decoration: none;
+}
+
+section.footnotes,
+div.footnotes,
+.footnotes {
+  margin-top: 2em;
+  padding-top: 0.5em;
+  border-top: 1px solid #000;
+  font-size: 0.85em;
+}
+
+.footnotes ol {
+  padding-left: 1.4em;
+}
+
+.footnotes li {
+  margin-bottom: 0.4em;
+}
+
+a.footnote-backref {
+  text-decoration: none;
+}
+
+/* ---- Math ---------------------------------------------------------- */
+
+img.math-inline {
+  display: inline;
+  margin: 0;
+  page-break-inside: avoid;
+}
+
+img.math-display,
+.math-display {
+  display: block;
+  margin: 0.8em auto;
+  text-align: center;
+}
+
+math[display="block"] {
+  display: block;
+  margin: 0.8em auto;
+  text-align: center;
+}
+
+code.math-error {
+  font-style: italic;
+}
+
+/* ---- Cover --------------------------------------------------------- */
+
+div.cover {
+  margin: 0;
+  padding: 0;
+  text-align: center;
+}
+
+div.cover img {
+  max-width: 100%;
+  height: auto;
+}
+
+/* ---- Note pages ---------------------------------------------------- */
+
+/*
+ * Each note page is its own spine item holding one full-page image. Breaks
+ * are forced before and after so it always starts on a fresh page and
+ * nothing follows it on the same page.
+ */
 .notes-page {
+  margin: 0;
+  padding: 0;
+  text-align: center;
+  text-indent: 0;
   page-break-before: always;
+  break-before: page;
   page-break-after: always;
+  break-after: page;
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+.notes-page img {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+  padding: 0;
+  border: 0;
 }
