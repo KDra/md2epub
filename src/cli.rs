@@ -148,4 +148,70 @@ mod tests {
         );
         assert_eq!(cli.flags.profile.as_deref(), Some("scribe"));
     }
+
+    #[test]
+    fn global_flags_before_build_and_repeated_authors() {
+        let cli = Cli::try_parse_from([
+            "md2epub",
+            "--grayscale",
+            "--author",
+            "A",
+            "--author",
+            "B",
+            "build",
+            "book.toml",
+            "-v",
+            "--notes",
+            "after-chapter",
+            "--notes-style",
+            "dotted",
+            "--notes-pages",
+            "2",
+            "--margin",
+            "wide",
+            "--line-spacing",
+            "1.4",
+            "--svg",
+            "rasterize",
+            "--split-level",
+            "none",
+        ])
+        .unwrap();
+        assert!(cli.inputs.is_empty());
+        assert!(cli.flags.grayscale && cli.flags.verbose && !cli.flags.offline);
+        assert_eq!(cli.flags.authors, vec!["A", "B"]);
+        assert_eq!(cli.flags.notes, Some(NotesPlacement::AfterChapter));
+        assert_eq!(cli.flags.notes_style, Some(NotesStyle::Dotted));
+        assert_eq!(cli.flags.notes_pages, Some(2));
+        assert_eq!(cli.flags.margin, Some(Margin::Wide));
+        assert_eq!(cli.flags.line_spacing, Some(1.4));
+        assert_eq!(cli.flags.svg, Some(SvgMode::Rasterize));
+        assert_eq!(cli.flags.split_level.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn unset_options_are_none() {
+        let cli = Cli::try_parse_from(["md2epub", "a.md"]).unwrap();
+        assert_eq!(cli.command, None);
+        assert_eq!(cli.flags, Flags::default());
+    }
+
+    #[test]
+    fn invalid_values_are_rejected() {
+        for args in [
+            &["md2epub", "a.md", "--math", "katex"][..],
+            &["md2epub", "a.md", "--notes", "sometimes"],
+            &["md2epub", "a.md", "--notes-pages", "many"],
+            &["md2epub", "a.md", "--line-spacing", "wide"],
+            &["md2epub", "a.md", "--margin", "huge"],
+            &["md2epub", "a.md", "--no-such-flag"],
+            &["md2epub", "build"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
+        let err = Cli::try_parse_from(["md2epub", "a.md", "--svg", "pdf"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rasterize, keep"), "{err}");
+    }
 }

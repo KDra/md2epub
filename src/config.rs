@@ -13,115 +13,1030 @@
 //! - `opts.meta.title` stays empty when nothing provides a title; the
 //!   pipeline then falls back to the first `<h1>`, then the file stem.
 //! - Errors clearly on missing inputs and unknown extensions (accepted:
-//!   `.md`, `.markdown`, `.html`, `.htm`, `.xhtml`).
+//!   `.md`, `.markdown`, `.mdown`, `.mkd`, `.html`, `.htm`, `.xhtml`).
 //!
 //! The pipeline calls `resolve(cli, None)` first to learn the inputs, then
 //! again with the first Markdown input's front matter.
 //!
-//! The T0 stub applies flags over the profile defaults only.
+//! ## `book.toml`
+//!
+//! Holds the same keys as the long flags (kebab-case; `snake_case` is
+//! accepted too) plus `inputs = [...]`:
+//!
+//! ```toml
+//! title = "My Book"
+//! authors = ["Ada Lovelace"]        # or author = "Ada Lovelace"
+//! lang = "en"
+//! date = 2026-01-15                 # TOML date or string
+//! identifier = "urn:isbn:..."       # optional
+//! inputs = ["intro.md", "part1.md"]
+//! output = "my-book.epub"
+//! cover = "cover.jpg"
+//! profile = "scribe"
+//! split-level = 2                   # 1, 2 or "none"
+//! notes = "after-chapter"
+//! notes-style = "lined"
+//! notes-pages = 1
+//! margin = "wide"
+//! line-spacing = 1.5
+//! math = "image"
+//! svg = "rasterize"
+//! grayscale = false
+//! css = "extra.css"
+//! offline = true
+//! verbose = false
+//! ```
+//!
+//! Unknown keys are an error so that typos do not go unnoticed. As a
+//! convenience, `md2epub book.toml` (a single `.toml` input and no
+//! subcommand) behaves like `md2epub build book.toml`.
+//!
+//! Boolean flags (`--grayscale`, `--offline`, `-v`) can only switch a
+//! setting on from the command line; `book.toml` decides when the flag is
+//! absent. If a [`Cli`] carries both `build` and positional inputs (possible
+//! through the library API), the positional inputs replace the TOML `inputs`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
+use serde_yaml::Value as Yaml;
 
-use crate::cli::{Cli, Command};
-use crate::model::{Options, parse_split_level};
+use crate::cli::{Cli, Command, Flags};
+use crate::model::{
+    Margin, MathMode, Metadata, NotesPlacement, NotesStyle, Options, SvgMode, parse_split_level,
+};
+use crate::pipeline::InputKind;
 use crate::profile;
+
+/// Input file extensions accepted by the pipeline (lowercase, no dot).
+pub const INPUT_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "html", "htm", "xhtml"];
+
+/// Keys accepted in `book.toml` (canonical kebab-case spelling).
+const TOML_KEYS: &[&str] = &[
+    "title",
+    "author",
+    "authors",
+    "lang",
+    "date",
+    "identifier",
+    "inputs",
+    "output",
+    "cover",
+    "profile",
+    "split-level",
+    "notes",
+    "notes-style",
+    "notes-pages",
+    "margin",
+    "line-spacing",
+    "math",
+    "svg",
+    "grayscale",
+    "css",
+    "offline",
+    "verbose",
+];
+
+/// Upper bound for `notes-pages`, to catch typos such as `notes-pages = 1000`.
+const MAX_NOTES_PAGES: u32 = 100;
 
 /// Resolves the final options and input list. See the module docs.
 pub fn resolve(cli: &Cli, front_matter: Option<&str>) -> Result<(Options, Vec<PathBuf>)> {
-    let _ = front_matter;
-    if let Some(Command::Build { config }) = &cli.command {
-        bail!(
-            "'build {}': book.toml support is not available in this build",
-            config.display()
-        );
-    }
-    let f = &cli.flags;
-    let profile = match &f.profile {
-        Some(name) => profile::by_name(name)?,
-        None => profile::generic(),
-    };
-    let mut opts = Options {
-        svg: profile.svg,
-        math: profile.math,
-        profile,
-        ..Options::default()
-    };
-    if let Some(t) = &f.title {
-        opts.meta.title = t.clone();
-    }
-    if !f.authors.is_empty() {
-        opts.meta.authors = f.authors.clone();
-    }
-    if let Some(l) = &f.lang {
-        opts.meta.lang = l.clone();
-    }
-    opts.cover = f.cover.clone();
-    if let Some(s) = &f.split_level {
-        opts.split_level = parse_split_level(s)?;
-    }
-    if let Some(v) = f.notes {
-        opts.notes = v;
-    }
-    if let Some(v) = f.notes_style {
-        opts.notes_style = v;
-    }
-    if let Some(v) = f.notes_pages {
-        opts.notes_pages = v;
-    }
-    if let Some(v) = f.margin {
-        opts.margin = v;
-    }
-    opts.line_spacing = f.line_spacing;
-    if let Some(v) = f.math {
-        opts.math = v;
-    }
-    if let Some(v) = f.svg {
-        opts.svg = v;
-    }
-    opts.grayscale = f.grayscale;
-    opts.offline = f.offline;
-    opts.extra_css = f.css.clone();
-    opts.verbose = f.verbose;
-    opts.output = f.output.clone();
+    let mut flags = Layer::from_flags(&cli.flags)?;
 
-    if cli.inputs.is_empty() {
-        bail!("no input files given (usage: md2epub <inputs...> -o book.epub)");
+    let shortcut = cli.command.is_none() && is_toml_shortcut(&cli.inputs);
+    let toml_path = match &cli.command {
+        Some(Command::Build { config }) => Some(config.clone()),
+        None if shortcut => Some(cli.inputs[0].clone()),
+        None => None,
+    };
+    if !shortcut && !cli.inputs.is_empty() {
+        flags.inputs = Some(cli.inputs.clone());
     }
-    for input in &cli.inputs {
+    let book = match &toml_path {
+        Some(path) => Layer::from_toml_file(path)?,
+        None => Layer::default(),
+    };
+
+    let mut merged = flags.over(book);
+    let inputs = merged.inputs.take().unwrap_or_default();
+    check_inputs(&inputs, toml_path.as_deref())?;
+
+    if let Some(fm) = front_matter {
+        let base = parent_dir(&inputs[0]);
+        let fm_layer = Layer::from_front_matter(fm, &base)
+            .with_context(|| format!("front matter of {}", inputs[0].display()))?;
+        merged = merged.over(fm_layer);
+    }
+
+    let opts = merged.into_options()?;
+    Ok((opts, inputs))
+}
+
+/// `md2epub book.toml` without the `build` subcommand.
+fn is_toml_shortcut(inputs: &[PathBuf]) -> bool {
+    inputs.len() == 1
+        && inputs[0]
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("toml"))
+}
+
+/// Errors clearly when there are no inputs, a file is missing or not a
+/// regular file, or its extension is not supported.
+fn check_inputs(inputs: &[PathBuf], toml: Option<&Path>) -> Result<()> {
+    if inputs.is_empty() {
+        match toml {
+            Some(t) => bail!(
+                "no input files: add `inputs = [\"chapter1.md\", ...]` to {}",
+                t.display()
+            ),
+            None => bail!(
+                "no input files given (usage: md2epub <inputs...> -o book.epub, or md2epub build book.toml)"
+            ),
+        }
+    }
+    for input in inputs {
+        if input.is_dir() {
+            bail!(
+                "input '{}' is a directory, not a file (list the .md/.html files instead)",
+                input.display()
+            );
+        }
         if !input.is_file() {
             bail!("input file not found: {}", input.display());
         }
+        if InputKind::of(input).is_err() {
+            let ext = input
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_else(|| "no extension".into());
+            bail!(
+                "unsupported input '{}' ({ext}): expected one of {}",
+                input.display(),
+                INPUT_EXTENSIONS
+                    .iter()
+                    .map(|e| format!(".{e}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
-    Ok((opts, cli.inputs.clone()))
+    Ok(())
+}
+
+/// Directory of `path`, or `.` when it has none.
+fn parent_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// Joins `p` onto `base` unless it is absolute.
+fn rel_to(base: &Path, p: &str) -> PathBuf {
+    let p = Path::new(p);
+    if p.is_absolute() || base == Path::new(".") {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    }
+}
+
+/// One source of settings. `None` means "not set here".
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Layer {
+    title: Option<String>,
+    authors: Option<Vec<String>>,
+    lang: Option<String>,
+    date: Option<String>,
+    identifier: Option<String>,
+    inputs: Option<Vec<PathBuf>>,
+    output: Option<PathBuf>,
+    cover: Option<PathBuf>,
+    profile: Option<String>,
+    /// `Some(None)` is an explicit `none`.
+    split_level: Option<Option<u8>>,
+    notes: Option<NotesPlacement>,
+    notes_style: Option<NotesStyle>,
+    notes_pages: Option<u32>,
+    margin: Option<Margin>,
+    line_spacing: Option<f32>,
+    math: Option<MathMode>,
+    svg: Option<SvgMode>,
+    grayscale: Option<bool>,
+    css: Option<PathBuf>,
+    offline: Option<bool>,
+    verbose: Option<bool>,
+}
+
+impl Layer {
+    /// Settings given on the command line. Inputs are filled by the caller.
+    fn from_flags(f: &Flags) -> Result<Layer> {
+        let split_level = match &f.split_level {
+            Some(s) => Some(parse_split_level(s).context("--split-level")?),
+            None => None,
+        };
+        if let Some(p) = &f.profile {
+            profile::by_name(p).context("--profile")?;
+        }
+        if let Some(ls) = f.line_spacing {
+            check_line_spacing(ls).context("--line-spacing")?;
+        }
+        if let Some(n) = f.notes_pages {
+            check_notes_pages(n).context("--notes-pages")?;
+        }
+        Ok(Layer {
+            title: f.title.clone(),
+            authors: (!f.authors.is_empty()).then(|| f.authors.clone()),
+            lang: f.lang.clone(),
+            date: None,
+            identifier: None,
+            inputs: None,
+            output: f.output.clone(),
+            cover: f.cover.clone(),
+            profile: f.profile.clone(),
+            split_level,
+            notes: f.notes,
+            notes_style: f.notes_style,
+            notes_pages: f.notes_pages,
+            margin: f.margin,
+            line_spacing: f.line_spacing,
+            math: f.math,
+            svg: f.svg,
+            grayscale: f.grayscale.then_some(true),
+            css: f.css.clone(),
+            offline: f.offline.then_some(true),
+            verbose: f.verbose.then_some(true),
+        })
+    }
+
+    /// Reads and parses a `book.toml` file.
+    fn from_toml_file(path: &Path) -> Result<Layer> {
+        if path.is_dir() {
+            bail!("book file '{}' is a directory", path.display());
+        }
+        if !path.is_file() {
+            bail!("book file not found: {}", path.display());
+        }
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        Layer::from_toml_str(&text, &parent_dir(path))
+            .with_context(|| format!("in {}", path.display()))
+    }
+
+    /// Parses `book.toml` text; relative paths are joined onto `base`.
+    fn from_toml_str(text: &str, base: &Path) -> Result<Layer> {
+        let table: toml::Table = toml::from_str(text).map_err(|e| anyhow!("invalid TOML: {e}"))?;
+        let mut l = Layer::default();
+        for (raw_key, value) in &table {
+            let key = raw_key.trim().to_ascii_lowercase().replace('_', "-");
+            let ctx = || format!("key `{raw_key}`");
+            match key.as_str() {
+                "title" => l.title = Some(toml_string(value).with_context(ctx)?),
+                "author" | "authors" => {
+                    let list = toml_string_list(value).with_context(ctx)?;
+                    l.authors = Some(clean_authors(list));
+                }
+                "lang" | "language" => l.lang = Some(toml_string(value).with_context(ctx)?),
+                "date" => l.date = Some(toml_scalar(value).with_context(ctx)?),
+                "identifier" => l.identifier = Some(toml_string(value).with_context(ctx)?),
+                "inputs" | "input" => {
+                    let list = toml_string_list(value).with_context(ctx)?;
+                    l.inputs = Some(list.iter().map(|p| rel_to(base, p)).collect());
+                }
+                "output" => l.output = Some(rel_to(base, &toml_string(value).with_context(ctx)?)),
+                "cover" => l.cover = Some(rel_to(base, &toml_string(value).with_context(ctx)?)),
+                "css" => l.css = Some(rel_to(base, &toml_string(value).with_context(ctx)?)),
+                "profile" => {
+                    let name = toml_string(value).with_context(ctx)?;
+                    profile::by_name(&name).with_context(ctx)?;
+                    l.profile = Some(name);
+                }
+                "split-level" => {
+                    let s = toml_scalar(value).with_context(ctx)?;
+                    l.split_level = Some(parse_split_level(&s).with_context(ctx)?);
+                }
+                "notes" => {
+                    // `notes = false` reads naturally as "no note pages".
+                    l.notes = Some(match value {
+                        toml::Value::Boolean(false) => NotesPlacement::None,
+                        _ => toml_parse(value).with_context(ctx)?,
+                    })
+                }
+                "notes-style" => l.notes_style = Some(toml_parse(value).with_context(ctx)?),
+                "margin" => l.margin = Some(toml_parse(value).with_context(ctx)?),
+                "math" => l.math = Some(toml_parse(value).with_context(ctx)?),
+                "svg" => l.svg = Some(toml_parse(value).with_context(ctx)?),
+                "notes-pages" => {
+                    let n = match value {
+                        toml::Value::Integer(n) => u32::try_from(*n)
+                            .map_err(|_| anyhow!("expected a non-negative whole number, got {n}")),
+                        other => Err(type_error("a whole number", other)),
+                    }
+                    .with_context(ctx)?;
+                    check_notes_pages(n).with_context(ctx)?;
+                    l.notes_pages = Some(n);
+                }
+                "line-spacing" => {
+                    let f = match value {
+                        toml::Value::Float(f) => Ok(*f as f32),
+                        toml::Value::Integer(i) => Ok(*i as f32),
+                        other => Err(type_error("a number such as 1.5", other)),
+                    }
+                    .with_context(ctx)?;
+                    check_line_spacing(f).with_context(ctx)?;
+                    l.line_spacing = Some(f);
+                }
+                "grayscale" => l.grayscale = Some(toml_bool(value).with_context(ctx)?),
+                "offline" => l.offline = Some(toml_bool(value).with_context(ctx)?),
+                "verbose" => l.verbose = Some(toml_bool(value).with_context(ctx)?),
+                _ => bail!(
+                    "unknown key `{raw_key}`: expected one of {}",
+                    TOML_KEYS.join(", ")
+                ),
+            }
+        }
+        Ok(l)
+    }
+
+    /// Parses YAML front matter (with or without its `---` delimiters).
+    /// Only metadata keys are read; other keys are ignored.
+    fn from_front_matter(text: &str, base: &Path) -> Result<Layer> {
+        let body = strip_front_matter_delimiters(text);
+        let value: Yaml =
+            serde_yaml::from_str(body).map_err(|e| anyhow!("invalid YAML front matter: {e}"))?;
+        let map = match value {
+            Yaml::Null => return Ok(Layer::default()),
+            Yaml::Mapping(m) => m,
+            _ => bail!("YAML front matter must be a mapping of `key: value` pairs"),
+        };
+        let mut l = Layer::default();
+        for (k, v) in &map {
+            let Some(raw_key) = k.as_str() else { continue };
+            let key = raw_key.trim().to_ascii_lowercase();
+            let ctx = || format!("key `{raw_key}`");
+            if v.is_null() {
+                continue;
+            }
+            match key.as_str() {
+                "title" => l.title = Some(yaml_scalar(v).with_context(ctx)?),
+                "author" | "authors" | "creator" => {
+                    l.authors = Some(clean_authors(yaml_authors(v).with_context(ctx)?))
+                }
+                "lang" | "language" => l.lang = Some(yaml_scalar(v).with_context(ctx)?),
+                "date" => l.date = Some(yaml_scalar(v).with_context(ctx)?),
+                "identifier" => l.identifier = Some(yaml_scalar(v).with_context(ctx)?),
+                "cover" | "cover-image" | "cover_image" => {
+                    l.cover = Some(rel_to(base, &yaml_scalar(v).with_context(ctx)?))
+                }
+                _ => {}
+            }
+        }
+        Ok(l)
+    }
+
+    /// Fills every unset field of `self` from `lower`.
+    fn over(self, lower: Layer) -> Layer {
+        Layer {
+            title: self.title.or(lower.title),
+            authors: self.authors.or(lower.authors),
+            lang: self.lang.or(lower.lang),
+            date: self.date.or(lower.date),
+            identifier: self.identifier.or(lower.identifier),
+            inputs: self.inputs.or(lower.inputs),
+            output: self.output.or(lower.output),
+            cover: self.cover.or(lower.cover),
+            profile: self.profile.or(lower.profile),
+            split_level: self.split_level.or(lower.split_level),
+            notes: self.notes.or(lower.notes),
+            notes_style: self.notes_style.or(lower.notes_style),
+            notes_pages: self.notes_pages.or(lower.notes_pages),
+            margin: self.margin.or(lower.margin),
+            line_spacing: self.line_spacing.or(lower.line_spacing),
+            math: self.math.or(lower.math),
+            svg: self.svg.or(lower.svg),
+            grayscale: self.grayscale.or(lower.grayscale),
+            css: self.css.or(lower.css),
+            offline: self.offline.or(lower.offline),
+            verbose: self.verbose.or(lower.verbose),
+        }
+    }
+
+    /// Applies the merged layer over the profile defaults.
+    fn into_options(self) -> Result<Options> {
+        let profile = match &self.profile {
+            Some(name) => profile::by_name(name)?,
+            None => profile::generic(),
+        };
+        let d = Options::default();
+        let non_empty =
+            |s: Option<String>| s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let meta = Metadata {
+            title: self.title.map(|t| t.trim().to_string()).unwrap_or_default(),
+            authors: self.authors.map(clean_authors).unwrap_or_default(),
+            lang: non_empty(self.lang).unwrap_or_else(|| d.meta.lang.clone()),
+            identifier: non_empty(self.identifier),
+            date: non_empty(self.date),
+        };
+        Ok(Options {
+            svg: self.svg.unwrap_or(profile.svg),
+            math: self.math.unwrap_or(profile.math),
+            profile,
+            meta,
+            cover: self.cover,
+            split_level: self.split_level.unwrap_or(d.split_level),
+            notes: self.notes.unwrap_or(d.notes),
+            notes_style: self.notes_style.unwrap_or(d.notes_style),
+            notes_pages: self.notes_pages.unwrap_or(d.notes_pages),
+            margin: self.margin.unwrap_or(d.margin),
+            line_spacing: self.line_spacing,
+            grayscale: self.grayscale.unwrap_or(d.grayscale),
+            offline: self.offline.unwrap_or(d.offline),
+            extra_css: self.css,
+            verbose: self.verbose.unwrap_or(d.verbose),
+            output: self.output,
+        })
+    }
+}
+
+fn check_line_spacing(v: f32) -> Result<()> {
+    if !v.is_finite() || v <= 0.0 || v > 10.0 {
+        bail!("invalid line spacing {v}: expected a number between 0 and 10, such as 1.5");
+    }
+    Ok(())
+}
+
+fn check_notes_pages(n: u32) -> Result<()> {
+    if n > MAX_NOTES_PAGES {
+        bail!("invalid number of note pages {n}: expected 0 to {MAX_NOTES_PAGES}");
+    }
+    Ok(())
+}
+
+/// Trims names and drops empty ones.
+fn clean_authors(list: Vec<String>) -> Vec<String> {
+    list.into_iter()
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect()
+}
+
+fn type_error(expected: &str, got: &toml::Value) -> anyhow::Error {
+    anyhow!("expected {expected}, got {} `{got}`", got.type_str())
+}
+
+fn toml_string(v: &toml::Value) -> Result<String> {
+    match v {
+        toml::Value::String(s) => Ok(s.clone()),
+        other => Err(type_error("a string", other)),
+    }
+}
+
+/// A string, number or date rendered as a string.
+fn toml_scalar(v: &toml::Value) -> Result<String> {
+    match v {
+        toml::Value::String(s) => Ok(s.clone()),
+        toml::Value::Integer(i) => Ok(i.to_string()),
+        toml::Value::Float(f) => Ok(f.to_string()),
+        toml::Value::Datetime(d) => Ok(d.to_string()),
+        other => Err(type_error("a string, number or date", other)),
+    }
+}
+
+fn toml_string_list(v: &toml::Value) -> Result<Vec<String>> {
+    match v {
+        toml::Value::String(s) => Ok(vec![s.clone()]),
+        toml::Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| toml_string(item).with_context(|| format!("item {}", i + 1)))
+            .collect(),
+        other => Err(type_error("a string or a list of strings", other)),
+    }
+}
+
+fn toml_bool(v: &toml::Value) -> Result<bool> {
+    match v {
+        toml::Value::Boolean(b) => Ok(*b),
+        other => Err(type_error("true or false", other)),
+    }
+}
+
+/// A string value parsed through `FromStr` (the mode enums).
+fn toml_parse<T>(v: &toml::Value) -> Result<T>
+where
+    T: std::str::FromStr<Err = anyhow::Error>,
+{
+    toml_string(v)?.parse()
+}
+
+/// Removes a leading `---` line and a trailing `---`/`...` line, if present.
+fn strip_front_matter_delimiters(text: &str) -> &str {
+    let mut s = text.trim_start_matches('\u{feff}');
+    let first_line_end = s.find('\n').map_or(s.len(), |i| i + 1);
+    if s[..first_line_end].trim() == "---" {
+        s = &s[first_line_end..];
+    }
+    let trimmed = s.trim_end();
+    let last_line_start = trimmed.rfind('\n').map_or(0, |i| i + 1);
+    let last = trimmed[last_line_start..].trim();
+    if last == "---" || last == "..." {
+        &trimmed[..last_line_start]
+    } else {
+        s
+    }
+}
+
+/// A YAML scalar (string, number, bool) as a string.
+fn yaml_scalar(v: &Yaml) -> Result<String> {
+    match v {
+        Yaml::String(s) => Ok(s.clone()),
+        Yaml::Number(n) => Ok(n.to_string()),
+        Yaml::Bool(b) => Ok(b.to_string()),
+        Yaml::Tagged(t) => yaml_scalar(&t.value),
+        Yaml::Null => Ok(String::new()),
+        Yaml::Sequence(_) => bail!("expected a single value, got a list"),
+        Yaml::Mapping(_) => bail!("expected a single value, got a mapping"),
+    }
+}
+
+/// `author: Name`, `authors: [A, B]`, or Pandoc-style `- name: A` entries.
+fn yaml_authors(v: &Yaml) -> Result<Vec<String>> {
+    match v {
+        Yaml::Sequence(items) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| yaml_author(item).with_context(|| format!("item {}", i + 1)))
+            .collect(),
+        other => Ok(vec![yaml_author(other)?]),
+    }
+}
+
+fn yaml_author(v: &Yaml) -> Result<String> {
+    match v {
+        Yaml::Mapping(m) => match m.get("name") {
+            Some(name) => yaml_scalar(name),
+            None => bail!("an author given as a mapping needs a `name` key"),
+        },
+        other => yaml_scalar(other),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::fs;
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    fn cli(args: &[&str]) -> Cli {
+        let mut v = vec!["md2epub"];
+        v.extend_from_slice(args);
+        Cli::try_parse_from(v).unwrap()
+    }
+
+    fn path_str(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    /// A temp dir with `a.md`, `b.html` and a `book.toml` built from `toml`.
+    fn book_dir(toml: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "# A\n").unwrap();
+        fs::write(dir.path().join("b.html"), "<p>b</p>").unwrap();
+        let book = dir.path().join("book.toml");
+        fs::write(&book, toml).unwrap();
+        (dir, book)
+    }
+
+    fn err_of(r: Result<(Options, Vec<PathBuf>)>) -> String {
+        format!("{:#}", r.unwrap_err())
+    }
+
+    // ---- defaults and flags -------------------------------------------------
 
     #[test]
-    fn flags_override_profile() {
-        let cli = Cli::try_parse_from([
-            "md2epub",
-            "Cargo.toml",
+    fn defaults_without_flags() {
+        let md = fixture("kitchen-sink.md");
+        let (opts, inputs) = resolve(&cli(&[&path_str(&md)]), None).unwrap();
+        assert_eq!(inputs, vec![md]);
+        assert_eq!(opts, Options::default());
+        assert!(opts.meta.title.is_empty(), "title left for the pipeline");
+    }
+
+    #[test]
+    fn all_flags_apply() {
+        let md = path_str(&fixture("kitchen-sink.md"));
+        let c = cli(&[
+            &md,
+            "-o",
+            "out.epub",
             "--profile",
-            "scribe",
+            "remarkable",
+            "--title",
+            "T",
+            "--author",
+            "A",
+            "--author",
+            "B",
+            "--lang",
+            "de",
+            "--cover",
+            "c.png",
+            "--split-level",
+            "none",
+            "--notes",
+            "end",
+            "--notes-style",
+            "grid",
+            "--notes-pages",
+            "3",
+            "--margin",
+            "extra",
+            "--line-spacing",
+            "1.8",
+            "--math",
+            "mathml",
             "--svg",
             "keep",
-        ])
+            "--grayscale",
+            "--css",
+            "x.css",
+            "--offline",
+            "-v",
+        ]);
+        let (o, _) = resolve(&c, None).unwrap();
+        assert_eq!(o.output, Some(PathBuf::from("out.epub")));
+        assert_eq!(o.profile.name, "remarkable");
+        assert_eq!(o.meta.title, "T");
+        assert_eq!(o.meta.authors, vec!["A", "B"]);
+        assert_eq!(o.meta.lang, "de");
+        assert_eq!(o.cover, Some(PathBuf::from("c.png")));
+        assert_eq!(o.split_level, None);
+        assert_eq!(o.notes, NotesPlacement::End);
+        assert_eq!(o.notes_style, NotesStyle::Grid);
+        assert_eq!(o.notes_pages, 3);
+        assert_eq!(o.margin, Margin::Extra);
+        assert_eq!(o.line_spacing, Some(1.8));
+        assert_eq!(o.math, MathMode::Mathml);
+        assert_eq!(o.svg, SvgMode::Keep);
+        assert!(o.grayscale && o.offline && o.verbose);
+        assert_eq!(o.extra_css, Some(PathBuf::from("x.css")));
+    }
+
+    // ---- profiles -----------------------------------------------------------
+
+    #[test]
+    fn each_profile_sets_defaults() {
+        let md = path_str(&fixture("kitchen-sink.md"));
+        for (name, w, h, svg, flatten) in [
+            ("scribe", 1860, 2480, SvgMode::Rasterize, true),
+            ("remarkable", 1404, 1872, SvgMode::Rasterize, true),
+            ("remarkable-pro", 1620, 2160, SvgMode::Rasterize, true),
+            ("generic", 1600, 2133, SvgMode::Keep, false),
+        ] {
+            let (o, _) = resolve(&cli(&[&md, "--profile", name]), None).unwrap();
+            assert_eq!(o.profile.name, name);
+            assert_eq!((o.profile.screen_w, o.profile.screen_h), (w, h));
+            assert_eq!(o.svg, svg, "{name}");
+            assert_eq!(o.math, MathMode::Image, "{name}");
+            assert_eq!(o.profile.flatten_alpha, flatten, "{name}");
+        }
+    }
+
+    #[test]
+    fn flags_override_profile_defaults() {
+        let md = path_str(&fixture("kitchen-sink.md"));
+        let (o, _) = resolve(
+            &cli(&[&md, "--profile", "scribe", "--svg", "keep", "--math", "off"]),
+            None,
+        )
         .unwrap();
-        let (opts, inputs) = resolve(&cli, None).unwrap();
-        assert_eq!(opts.profile.name, "scribe");
-        assert_eq!(opts.svg, crate::model::SvgMode::Keep);
-        assert_eq!(inputs.len(), 1);
+        assert_eq!(o.profile.name, "scribe");
+        assert_eq!(o.svg, SvgMode::Keep);
+        assert_eq!(o.math, MathMode::Off);
+        assert!(o.profile.flatten_alpha);
+    }
+
+    // ---- precedence ---------------------------------------------------------
+
+    const FM: &str = "---\ntitle: FM Title\nauthor: FM Author\nlang: fr\ndate: 2020-02-02\ncover: fm-cover.png\n---\n";
+
+    #[test]
+    fn front_matter_over_defaults() {
+        let md = fixture("kitchen-sink.md");
+        let (o, _) = resolve(&cli(&[&path_str(&md)]), Some(FM)).unwrap();
+        assert_eq!(o.meta.title, "FM Title");
+        assert_eq!(o.meta.authors, vec!["FM Author"]);
+        assert_eq!(o.meta.lang, "fr");
+        assert_eq!(o.meta.date.as_deref(), Some("2020-02-02"));
+        // Front matter paths are relative to the first input's directory.
+        assert_eq!(o.cover, Some(fixture("fm-cover.png")));
+    }
+
+    #[test]
+    fn toml_over_front_matter() {
+        let (dir, book) = book_dir(
+            "title = \"Toml Title\"\nauthor = \"Toml Author\"\ninputs = [\"a.md\"]\nprofile = \"scribe\"\nmath = \"off\"\n",
+        );
+        let (o, inputs) = resolve(&cli(&["build", &path_str(&book)]), Some(FM)).unwrap();
+        assert_eq!(inputs, vec![dir.path().join("a.md")]);
+        assert_eq!(o.meta.title, "Toml Title");
+        assert_eq!(o.meta.authors, vec!["Toml Author"]);
+        // Not in the TOML: front matter still fills these.
+        assert_eq!(o.meta.lang, "fr");
+        assert_eq!(o.meta.date.as_deref(), Some("2020-02-02"));
+        assert_eq!(o.cover, Some(dir.path().join("fm-cover.png")));
+        // TOML over profile defaults; untouched settings keep the profile's.
+        assert_eq!(o.profile.name, "scribe");
+        assert_eq!(o.math, MathMode::Off);
+        assert_eq!(o.svg, SvgMode::Rasterize);
+    }
+
+    #[test]
+    fn flags_over_toml_and_front_matter() {
+        let (_dir, book) = book_dir(
+            "title = \"Toml\"\ninputs = [\"a.md\"]\nprofile = \"scribe\"\nsvg = \"rasterize\"\nmargin = \"wide\"\nnotes-pages = 2\ngrayscale = true\n",
+        );
+        let c = cli(&[
+            "build",
+            &path_str(&book),
+            "--title",
+            "Flag",
+            "--lang",
+            "it",
+            "--profile",
+            "generic",
+            "--margin",
+            "extra",
+        ]);
+        let (o, _) = resolve(&c, Some(FM)).unwrap();
+        assert_eq!(o.meta.title, "Flag");
+        assert_eq!(o.meta.lang, "it");
+        assert_eq!(o.meta.authors, vec!["FM Author"]);
+        assert_eq!(o.profile.name, "generic");
+        // svg set explicitly in TOML beats the (flag-chosen) profile default.
+        assert_eq!(o.svg, SvgMode::Rasterize);
+        assert_eq!(o.margin, Margin::Extra);
+        assert_eq!(o.notes_pages, 2);
+        // A bool flag that is absent does not reset the TOML value.
+        assert!(o.grayscale);
+    }
+
+    #[test]
+    fn toml_bool_false_holds_without_flag_and_flag_turns_on() {
+        let (_dir, book) = book_dir("inputs = [\"a.md\"]\noffline = false\n");
+        let (o, _) = resolve(&cli(&["build", &path_str(&book)]), None).unwrap();
+        assert!(!o.offline);
+        let (o, _) = resolve(&cli(&["build", &path_str(&book), "--offline"]), None).unwrap();
+        assert!(o.offline);
+    }
+
+    #[test]
+    fn cli_inputs_replace_toml_inputs() {
+        let (dir, book) = book_dir("inputs = [\"a.md\"]\n");
+        let b = dir.path().join("b.html");
+        // clap cannot place positionals before `build`, but the library API can.
+        let c = Cli {
+            command: Some(Command::Build { config: book }),
+            inputs: vec![b.clone()],
+            flags: Flags::default(),
+        };
+        let (_, inputs) = resolve(&c, None).unwrap();
+        assert_eq!(inputs, vec![b]);
+    }
+
+    // ---- book.toml ----------------------------------------------------------
+
+    #[test]
+    fn parses_fixture_book_toml() {
+        let book = fixture("book.toml");
+        let (o, inputs) = resolve(&cli(&["build", &path_str(&book)]), None).unwrap();
+        assert_eq!(
+            inputs,
+            vec![fixture("kitchen-sink.md"), fixture("page.html")]
+        );
+        assert_eq!(o.meta.title, "Fixture Book");
+        assert_eq!(o.meta.authors, vec!["Ada Lovelace", "Charles Babbage"]);
+        assert_eq!(o.meta.lang, "en");
+        assert_eq!(o.output, Some(fixture("fixture-book.epub")));
+        assert_eq!(o.cover, Some(fixture("photo.jpg")));
+        assert_eq!(o.profile.name, "scribe");
+        assert_eq!(o.split_level, Some(2));
+        assert_eq!(o.notes, NotesPlacement::AfterChapter);
+        assert_eq!(o.notes_style, NotesStyle::Lined);
+        assert_eq!(o.notes_pages, 1);
+        assert_eq!(o.margin, Margin::Wide);
+        assert_eq!(o.line_spacing, Some(1.5));
+        assert_eq!(o.math, MathMode::Image);
+        assert_eq!(o.svg, SvgMode::Rasterize);
+        assert!(!o.grayscale);
+        assert_eq!(o.extra_css, Some(fixture("extra.css")));
+        assert!(o.offline);
+    }
+
+    #[test]
+    fn toml_shortcut_without_build() {
+        let book = fixture("book.toml");
+        let (o, inputs) = resolve(&cli(&[&path_str(&book)]), None).unwrap();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(o.meta.title, "Fixture Book");
+    }
+
+    #[test]
+    fn toml_value_forms() {
+        let base = Path::new("/books");
+        let l = Layer::from_toml_str(
+            "author = \"Solo\"\ninput = \"one.md\"\nsplit_level = \"none\"\ndate = 2026-01-15\nline-spacing = 2\nnotes = false\nidentifier = \"urn:x\"\n",
+            base,
+        )
+        .unwrap();
+        assert_eq!(l.authors, Some(vec!["Solo".to_string()]));
+        assert_eq!(l.inputs, Some(vec![PathBuf::from("/books/one.md")]));
+        assert_eq!(l.split_level, Some(None));
+        assert_eq!(l.date.as_deref(), Some("2026-01-15"));
+        assert_eq!(l.line_spacing, Some(2.0));
+        assert_eq!(l.notes, Some(NotesPlacement::None));
+        assert_eq!(l.identifier.as_deref(), Some("urn:x"));
+        let l = Layer::from_toml_str("split-level = 1\n", base).unwrap();
+        assert_eq!(l.split_level, Some(Some(1)));
+        let l = Layer::from_toml_str("", base).unwrap();
+        assert_eq!(l, Layer::default());
+    }
+
+    #[test]
+    fn toml_absolute_paths_kept() {
+        let abs = std::env::temp_dir().join("abs-cover.png");
+        let text = format!("cover = {:?}\n", path_str(&abs));
+        let l = Layer::from_toml_str(&text, Path::new("/elsewhere")).unwrap();
+        assert_eq!(l.cover, Some(abs));
+    }
+
+    #[test]
+    fn toml_errors() {
+        let base = Path::new(".");
+        let cases = [
+            ("titel = \"x\"", "unknown key `titel`"),
+            ("title = 3", "expected a string"),
+            ("authors = [\"a\", 2]", "item 2"),
+            ("profile = \"kobo\"", "unknown profile 'kobo'"),
+            ("split-level = 9", "invalid split level"),
+            ("notes = \"sometimes\"", "invalid notes placement"),
+            ("notes-style = \"wavy\"", "invalid notes style"),
+            ("margin = \"huge\"", "invalid margin preset"),
+            ("math = \"katex\"", "invalid math mode"),
+            ("svg = \"pdf\"", "invalid svg mode"),
+            ("notes-pages = -1", "non-negative"),
+            ("notes-pages = 5000", "0 to 100"),
+            ("notes-pages = \"2\"", "whole number"),
+            ("line-spacing = \"wide\"", "number"),
+            ("line-spacing = 0.0", "invalid line spacing"),
+            ("grayscale = \"yes\"", "true or false"),
+            ("inputs = 3", "list of strings"),
+            ("title = ", "invalid TOML"),
+        ];
+        for (text, want) in cases {
+            let err = format!("{:#}", Layer::from_toml_str(text, base).unwrap_err());
+            assert!(err.contains(want), "{text:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn toml_file_errors() {
+        let err = err_of(resolve(&cli(&["build", "no/such/book.toml"]), None));
+        assert!(err.contains("book file not found"), "{err}");
+
+        let (_dir, book) = book_dir("title = \"x\"\n");
+        let err = err_of(resolve(&cli(&["build", &path_str(&book)]), None));
+        assert!(
+            err.contains("no input files") && err.contains("inputs ="),
+            "{err}"
+        );
+
+        let (_dir, book) = book_dir("inputs = [\"missing.md\"]\n");
+        let err = err_of(resolve(&cli(&["build", &path_str(&book)]), None));
+        assert!(err.contains("input file not found"), "{err}");
+
+        let (_dir, book) = book_dir("inputs = [\"a.md\"]\nbogus = 1\n");
+        let err = err_of(resolve(&cli(&["build", &path_str(&book)]), None));
+        assert!(err.contains("book.toml") && err.contains("bogus"), "{err}");
+    }
+
+    // ---- front matter -------------------------------------------------------
+
+    #[test]
+    fn front_matter_forms() {
+        let base = Path::new(".");
+        // Without delimiters, list of authors, numeric title, unknown keys.
+        let l = Layer::from_front_matter(
+            "title: 1984\nauthors:\n  - A\n  - name: B\n    affiliation: X\ntags: [x]\n",
+            base,
+        )
+        .unwrap();
+        assert_eq!(l.title.as_deref(), Some("1984"));
+        assert_eq!(l.authors, Some(vec!["A".to_string(), "B".to_string()]));
+        // With `...` terminator and BOM.
+        let l = Layer::from_front_matter("\u{feff}---\nlanguage: de\n...\n", base).unwrap();
+        assert_eq!(l.lang.as_deref(), Some("de"));
+        // Empty front matter and null values.
+        assert_eq!(
+            Layer::from_front_matter("---\n---\n", base).unwrap(),
+            Layer::default()
+        );
+        let l = Layer::from_front_matter("title:\nlang: en\n", base).unwrap();
+        assert_eq!(l.title, None);
+        // Front matter never sets non-metadata options.
+        let l = Layer::from_front_matter("profile: scribe\nmath: off\n", base).unwrap();
+        assert_eq!(l, Layer::default());
+    }
+
+    #[test]
+    fn front_matter_errors() {
+        let md = path_str(&fixture("kitchen-sink.md"));
+        let err = err_of(resolve(&cli(&[&md]), Some("---\ntitle: [unclosed\n---\n")));
+        assert!(err.contains("invalid YAML front matter"), "{err}");
+        assert!(err.contains("kitchen-sink.md"), "{err}");
+        let err = err_of(resolve(&cli(&[&md]), Some("- just\n- a list\n")));
+        assert!(err.contains("mapping"), "{err}");
+        let err = err_of(resolve(&cli(&[&md]), Some("title: {a: b}\n")));
+        assert!(err.contains("key `title`"), "{err}");
+        let err = err_of(resolve(&cli(&[&md]), Some("author:\n  - role: x\n")));
+        assert!(err.contains("`name`"), "{err}");
+    }
+
+    #[test]
+    fn blank_values_fall_back() {
+        let md = path_str(&fixture("kitchen-sink.md"));
+        let (o, _) = resolve(
+            &cli(&[&md, "--lang", " ", "--author", " "]),
+            Some("date: ''\n"),
+        )
+        .unwrap();
+        assert_eq!(o.meta.lang, "en");
+        assert!(o.meta.authors.is_empty());
+        assert_eq!(o.meta.date, None);
+    }
+
+    // ---- bad inputs ---------------------------------------------------------
+
+    #[test]
+    fn no_inputs_errors() {
+        let err = err_of(resolve(&cli(&[]), None));
+        assert!(err.contains("no input files given"), "{err}");
     }
 
     #[test]
     fn missing_input_errors() {
-        let cli = Cli::try_parse_from(["md2epub", "does-not-exist.md"]).unwrap();
-        assert!(resolve(&cli, None).is_err());
+        let err = err_of(resolve(&cli(&["does-not-exist.md"]), None));
+        assert!(
+            err.contains("input file not found: does-not-exist.md"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unknown_extension_errors() {
+        let toml = path_str(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"));
+        let err = err_of(resolve(&cli(&[&toml]), None));
+        assert!(err.contains("unsupported input"), "{err}");
+        assert!(err.contains(".lock") && err.contains(".md"), "{err}");
+        let jpg = path_str(&fixture("photo.jpg"));
+        let md = path_str(&fixture("kitchen-sink.md"));
+        let err = err_of(resolve(&cli(&[&md, &jpg]), None));
+        assert!(err.contains("photo.jpg"), "{err}");
+    }
+
+    #[test]
+    fn directory_input_errors() {
+        let dir = path_str(&fixture("images"));
+        let err = err_of(resolve(&cli(&[&dir]), None));
+        assert!(err.contains("is a directory"), "{err}");
+    }
+
+    #[test]
+    fn bad_flag_values_error() {
+        let md = path_str(&fixture("kitchen-sink.md"));
+        let err = err_of(resolve(&cli(&[&md, "--profile", "kobo"]), None));
+        assert!(err.contains("--profile") && err.contains("kobo"), "{err}");
+        let err = err_of(resolve(&cli(&[&md, "--split-level", "7"]), None));
+        assert!(err.contains("--split-level"), "{err}");
+        let err = err_of(resolve(&cli(&[&md, "--line-spacing", "0"]), None));
+        assert!(err.contains("--line-spacing"), "{err}");
+        let err = err_of(resolve(&cli(&[&md, "--notes-pages", "1000"]), None));
+        assert!(err.contains("--notes-pages"), "{err}");
+    }
+
+    #[test]
+    fn strip_delimiters() {
+        assert_eq!(strip_front_matter_delimiters("---\na: 1\n---\n"), "a: 1\n");
+        assert_eq!(strip_front_matter_delimiters("a: 1\n"), "a: 1\n");
+        assert_eq!(strip_front_matter_delimiters("---\na: 1\n...\n"), "a: 1\n");
+        assert_eq!(strip_front_matter_delimiters(""), "");
+        assert_eq!(strip_front_matter_delimiters("---"), "");
     }
 }
