@@ -1,6 +1,6 @@
 [package]
 name = "md2epub"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Convert rich Markdown or HTML into reflowable EPUB 3 for handwriting on Kindle Scribe and reMarkable"
 license = "MIT"
