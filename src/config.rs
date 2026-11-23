@@ -51,10 +51,19 @@
 //! convenience, `md2epub book.toml` (a single `.toml` input and no
 //! subcommand) behaves like `md2epub build book.toml`.
 //!
-//! Boolean flags (`--grayscale`, `--offline`, `-v`) can only switch a
-//! setting on from the command line; `book.toml` decides when the flag is
-//! absent. If a [`Cli`] carries both `build` and positional inputs (possible
-//! through the library API), the positional inputs replace the TOML `inputs`.
+//! Boolean flags (`--grayscale`, `--offline`, `-v`) switch a setting on and
+//! their negations (`--no-grayscale`, `--no-offline`, `--no-verbose`) switch
+//! it off; `book.toml` decides when neither is given. If a [`Cli`] carries
+//! both `build` and positional inputs (`md2epub a.md build book.toml`), the
+//! positional inputs replace the TOML `inputs`.
+//!
+//! A cover given by `--cover` or `book.toml` must exist (a missing one is an
+//! error); a cover from front matter that cannot be loaded is only a warning.
+//!
+//! [`finalize`] runs once per conversion on the resolved options: it
+//! normalizes and validates the language tag and the date and returns
+//! warnings for values it had to fix or drop, and for explicit `svg = keep`
+//! or `math = mathml` under a device profile.
 
 use std::path::{Path, PathBuf};
 
@@ -121,6 +130,9 @@ pub fn resolve(cli: &Cli, front_matter: Option<&str>) -> Result<(Options, Vec<Pa
     let mut merged = flags.over(book);
     let inputs = merged.inputs.take().unwrap_or_default();
     check_inputs(&inputs, toml_path.as_deref())?;
+    if let Some(cover) = &merged.cover {
+        check_cover(cover)?;
+    }
 
     if let Some(fm) = front_matter {
         let base = parent_dir(&inputs[0]);
@@ -163,6 +175,11 @@ fn check_inputs(inputs: &[PathBuf], toml: Option<&Path>) -> Result<()> {
             );
         }
         if !input.is_file() {
+            if input.as_os_str() == "build" {
+                bail!(
+                    "input file not found: build (to build from a book file, run `md2epub build <book.toml>`)"
+                );
+            }
             bail!("input file not found: {}", input.display());
         }
         if InputKind::of(input).is_err() {
@@ -180,6 +197,26 @@ fn check_inputs(inputs: &[PathBuf], toml: Option<&Path>) -> Result<()> {
                     .join(", ")
             );
         }
+    }
+    Ok(())
+}
+
+/// Errors when an explicitly configured cover file does not exist. URLs
+/// (`http(s)://`, `file://`, `data:`) are checked when they are loaded.
+fn check_cover(cover: &Path) -> Result<()> {
+    let s = cover.to_string_lossy();
+    let lower = s.to_ascii_lowercase();
+    let is_url = ["http://", "https://", "file:", "data:"]
+        .iter()
+        .any(|p| lower.starts_with(p));
+    if is_url {
+        return Ok(());
+    }
+    if cover.is_dir() {
+        bail!("cover '{}' is a directory, not an image", cover.display());
+    }
+    if !cover.is_file() {
+        bail!("cover image not found: {}", cover.display());
     }
     Ok(())
 }
@@ -263,10 +300,10 @@ impl Layer {
             line_spacing: f.line_spacing,
             math: f.math,
             svg: f.svg,
-            grayscale: f.grayscale.then_some(true),
+            grayscale: switch(f.grayscale, f.no_grayscale),
             css: f.css.clone(),
-            offline: f.offline.then_some(true),
-            verbose: f.verbose.then_some(true),
+            offline: switch(f.offline, f.no_offline),
+            verbose: switch(f.verbose, f.no_verbose),
         })
     }
 
@@ -431,10 +468,12 @@ impl Layer {
         let d = Options::default();
         let non_empty =
             |s: Option<String>| s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let lang = non_empty(self.lang);
+        let lang_given = lang.is_some();
         let meta = Metadata {
             title: self.title.map(|t| t.trim().to_string()).unwrap_or_default(),
             authors: self.authors.map(clean_authors).unwrap_or_default(),
-            lang: non_empty(self.lang).unwrap_or_else(|| d.meta.lang.clone()),
+            lang: lang.unwrap_or_else(|| d.meta.lang.clone()),
             identifier: non_empty(self.identifier),
             date: non_empty(self.date),
         };
@@ -455,8 +494,193 @@ impl Layer {
             extra_css: self.css,
             verbose: self.verbose.unwrap_or(d.verbose),
             output: self.output,
+            lang_given,
         })
     }
+}
+
+/// A boolean flag and its `--no-` negation (clap keeps only the last one).
+fn switch(on: bool, off: bool) -> Option<bool> {
+    if off {
+        Some(false)
+    } else if on {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Normalizes and checks resolved options. Returns warnings for values that
+/// were fixed or dropped. See the module docs.
+pub fn finalize(opts: &mut Options) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    let raw_lang = opts.meta.lang.trim().to_string();
+    match normalize_lang(&raw_lang) {
+        Some(tag) => opts.meta.lang = tag,
+        None => {
+            warnings.push(format!(
+                "invalid language tag '{raw_lang}' (expected a BCP 47 tag such as en, de or pt-BR); using 'en'"
+            ));
+            opts.meta.lang = "en".into();
+        }
+    }
+
+    if let Some(raw) = opts.meta.date.take() {
+        let raw = raw.trim().to_string();
+        match normalize_date(&raw) {
+            Some(d) => opts.meta.date = Some(d),
+            None => warnings.push(format!(
+                "date '{raw}' is not a valid or unambiguous date (expected YYYY, YYYY-MM or YYYY-MM-DD); it is left out"
+            )),
+        }
+    }
+
+    if opts.profile.flatten_alpha {
+        let name = &opts.profile.name;
+        if opts.svg == SvgMode::Keep {
+            warnings.push(format!(
+                "SVG kept under the {name} profile (--svg keep); Send to Kindle or the reMarkable may drop or reject it"
+            ));
+        }
+        if opts.math == MathMode::Mathml {
+            warnings.push(format!(
+                "math: MathML output under the {name} profile (--math mathml); Send to Kindle or the reMarkable may drop or reject it (use --math image)"
+            ));
+        }
+    }
+    warnings
+}
+
+/// Normalizes a language tag (`en_us` -> `en-US`, `EN` -> `en`,
+/// `zh_hant_tw` -> `zh-Hant-TW`) and checks it against the BCP 47 syntax.
+/// Returns `None` when it is not a well-formed tag.
+pub fn normalize_lang(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c == '_' || c.is_whitespace() {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let subtags: Vec<&str> = cleaned.split('-').collect();
+    if subtags.iter().any(|t| t.is_empty() || t.len() > 8)
+        || !subtags
+            .iter()
+            .all(|t| t.chars().all(|c| c.is_ascii_alphanumeric()))
+    {
+        return None;
+    }
+    let first = subtags[0].to_ascii_lowercase();
+    let private = first == "x";
+    if !private && !(first.len() >= 2 && first.chars().all(|c| c.is_ascii_alphabetic())) {
+        return None;
+    }
+    if private && subtags.len() < 2 {
+        return None;
+    }
+    let mut out = vec![first];
+    // After a singleton (extension or private use) the subtags are opaque.
+    let mut after_singleton = private;
+    for (i, t) in subtags.iter().enumerate().skip(1) {
+        let lower = t.to_ascii_lowercase();
+        if after_singleton {
+            out.push(lower);
+            continue;
+        }
+        if t.len() == 1 {
+            // A singleton must be followed by at least one subtag.
+            if i + 1 == subtags.len() {
+                return None;
+            }
+            after_singleton = true;
+            out.push(lower);
+        } else if t.len() == 4 && t.chars().all(|c| c.is_ascii_alphabetic()) && i == 1 {
+            // Script: titlecase (`Hant`).
+            let mut s = lower;
+            s[..1].make_ascii_uppercase();
+            out.push(s);
+        } else if t.len() == 2 && t.chars().all(|c| c.is_ascii_alphabetic()) {
+            // Region: uppercase (`US`).
+            out.push(t.to_ascii_uppercase());
+        } else {
+            out.push(lower);
+        }
+    }
+    Some(out.join("-"))
+}
+
+/// Normalizes a date to W3CDTF (`YYYY`, `YYYY-MM`, `YYYY-MM-DD`, optionally
+/// with a `T` time). Also accepts `YYYY/MM/DD`, `YYYY.MM.DD`, single-digit
+/// months and days, a space before the time, and `DD/MM/YYYY` or
+/// `MM/DD/YYYY` when only one reading is possible. Returns `None` for
+/// anything else (including impossible dates such as `2024-13-45`).
+pub fn normalize_date(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let (date, time) = match raw.split_once(['T', ' ']) {
+        Some((d, t)) => (d, Some(t.trim())),
+        None => (raw, None),
+    };
+    let parts: Vec<&str> = date.split(['-', '/', '.']).collect();
+    if parts
+        .iter()
+        .any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.len() > 4)
+    {
+        return None;
+    }
+    let num = |s: &str| s.parse::<u32>().ok();
+    let (y, m, d) = match parts.as_slice() {
+        [y] if y.len() == 4 => (num(y)?, None, None),
+        [y, m] if y.len() == 4 => (num(y)?, Some(num(m)?), None),
+        [y, m, d] if y.len() == 4 => (num(y)?, Some(num(m)?), Some(num(d)?)),
+        [a, b, y] if y.len() == 4 && a.len() <= 2 && b.len() <= 2 => {
+            let (a, b) = (num(a)?, num(b)?);
+            match (a > 12, b > 12) {
+                (true, false) => (num(y)?, Some(b), Some(a)),
+                (false, true) => (num(y)?, Some(a), Some(b)),
+                // `01/02/2024` could be either; `13/14/2024` is neither.
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let mut out = format!("{y:04}");
+    if let Some(m) = m {
+        if !(1..=12).contains(&m) {
+            return None;
+        }
+        out.push_str(&format!("-{m:02}"));
+    }
+    if let (Some(m), Some(d)) = (m, d) {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let days = match m {
+            2 if leap => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        if !(1..=days).contains(&d) {
+            return None;
+        }
+        out.push_str(&format!("-{d:02}"));
+    }
+    if let Some(t) = time {
+        let valid = d.is_some()
+            && !t.is_empty()
+            && t.starts_with(|c: char| c.is_ascii_digit())
+            && t.bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b':' | b'.' | b'Z' | b'+' | b'-'));
+        if !valid {
+            return None;
+        }
+        out.push('T');
+        out.push_str(t);
+    }
+    Some(out)
 }
 
 fn check_line_spacing(v: f32) -> Result<()> {
@@ -632,6 +856,7 @@ mod tests {
     #[test]
     fn all_flags_apply() {
         let md = path_str(&fixture("kitchen-sink.md"));
+        let cover = path_str(&fixture("photo.jpg"));
         let c = cli(&[
             &md,
             "-o",
@@ -647,7 +872,7 @@ mod tests {
             "--lang",
             "de",
             "--cover",
-            "c.png",
+            &cover,
             "--split-level",
             "none",
             "--notes",
@@ -676,7 +901,7 @@ mod tests {
         assert_eq!(o.meta.title, "T");
         assert_eq!(o.meta.authors, vec!["A", "B"]);
         assert_eq!(o.meta.lang, "de");
-        assert_eq!(o.cover, Some(PathBuf::from("c.png")));
+        assert_eq!(o.cover, Some(PathBuf::from(&cover)));
         assert_eq!(o.split_level, None);
         assert_eq!(o.notes, NotesPlacement::End);
         assert_eq!(o.notes_style, NotesStyle::Grid);
@@ -1038,5 +1263,178 @@ mod tests {
         assert_eq!(strip_front_matter_delimiters("---\na: 1\n...\n"), "a: 1\n");
         assert_eq!(strip_front_matter_delimiters(""), "");
         assert_eq!(strip_front_matter_delimiters("---"), "");
+    }
+
+    #[test]
+    fn negated_flags_turn_toml_booleans_off() {
+        let (_dir, book) =
+            book_dir("inputs = [\"a.md\"]\noffline = true\ngrayscale = true\nverbose = true\n");
+        let (o, _) = resolve(&cli(&["build", &path_str(&book)]), None).unwrap();
+        assert!(o.offline && o.grayscale && o.verbose);
+        let (o, _) = resolve(
+            &cli(&[
+                "build",
+                &path_str(&book),
+                "--no-offline",
+                "--no-grayscale",
+                "--no-verbose",
+            ]),
+            None,
+        )
+        .unwrap();
+        assert!(!o.offline && !o.grayscale && !o.verbose);
+    }
+
+    #[test]
+    fn explicit_missing_cover_is_an_error() {
+        let md = path_str(&fixture("kitchen-sink.md"));
+        let err = err_of(resolve(&cli(&[&md, "--cover", "nope-cover.png"]), None));
+        assert!(err.contains("cover image not found"), "{err}");
+        let (_dir, book) = book_dir("inputs = [\"a.md\"]\ncover = \"missing.png\"\n");
+        let err = err_of(resolve(&cli(&["build", &path_str(&book)]), None));
+        assert!(err.contains("cover image not found"), "{err}");
+        // URLs are checked when loaded; front matter covers only warn later.
+        assert!(
+            resolve(
+                &cli(&[&md, "--cover", "https://example.invalid/c.png"]),
+                None
+            )
+            .is_ok()
+        );
+        let (o, _) = resolve(&cli(&[&md]), Some("cover: nope.png\n")).unwrap();
+        assert!(o.cover.is_some());
+    }
+
+    #[test]
+    fn missing_build_input_hints_at_subcommand() {
+        let c = Cli {
+            command: None,
+            inputs: vec![PathBuf::from("build")],
+            flags: Flags::default(),
+        };
+        let err = err_of(resolve(&c, None));
+        assert!(err.contains("md2epub build"), "{err}");
+    }
+
+    #[test]
+    fn lang_given_tracks_explicit_language() {
+        let md = path_str(&fixture("kitchen-sink.md"));
+        let (o, _) = resolve(&cli(&[&md]), None).unwrap();
+        assert!(!o.lang_given);
+        assert_eq!(o.meta.lang, "en");
+        let (o, _) = resolve(&cli(&[&md, "--lang", "de"]), None).unwrap();
+        assert!(o.lang_given);
+        let (o, _) = resolve(&cli(&[&md]), Some("lang: fr\n")).unwrap();
+        assert!(o.lang_given);
+    }
+
+    #[test]
+    fn language_tags_are_normalized_and_validated() {
+        for (raw, want) in [
+            ("en", "en"),
+            ("EN", "en"),
+            ("en_US", "en-US"),
+            ("en us", "en-US"),
+            ("en-us", "en-US"),
+            ("zh_hant_tw", "zh-Hant-TW"),
+            ("es-419", "es-419"),
+            ("de-ch-1996", "de-CH-1996"),
+            ("x-private", "x-private"),
+            ("sl-rozaj-biske", "sl-rozaj-biske"),
+        ] {
+            let got = normalize_lang(raw);
+            assert_eq!(got.as_deref(), Some(want), "{raw}");
+        }
+        for bad in [
+            "",
+            "7",
+            "e",
+            "xx-invalid-tag-!!",
+            "en--US",
+            "toolongtag",
+            "en-",
+            "a-b-",
+        ] {
+            assert_eq!(normalize_lang(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn finalize_fixes_or_drops_bad_metadata() {
+        let mut o = Options::default();
+        o.meta.lang = "en_US".into();
+        o.meta.date = Some("2024/1/5".into());
+        assert!(finalize(&mut o).is_empty());
+        assert_eq!(o.meta.lang, "en-US");
+        assert_eq!(o.meta.date.as_deref(), Some("2024-01-05"));
+
+        let mut o = Options::default();
+        o.meta.lang = "xx-invalid-tag-!!".into();
+        o.meta.date = Some("2024-13-45".into());
+        let w = finalize(&mut o);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("language tag"), "{w:?}");
+        assert!(w[1].contains("2024-13-45"), "{w:?}");
+        assert_eq!(o.meta.lang, "en");
+        assert_eq!(o.meta.date, None);
+
+        // Front matter `lang: 7` reaches finalize as "7".
+        let md = path_str(&fixture("kitchen-sink.md"));
+        let (mut o, _) = resolve(&cli(&[&md]), Some("lang: 7\n")).unwrap();
+        assert_eq!(finalize(&mut o).len(), 1);
+        assert_eq!(o.meta.lang, "en");
+    }
+
+    #[test]
+    fn dates_are_normalized() {
+        for (raw, want) in [
+            ("2024", Some("2024")),
+            ("2024-01", Some("2024-01")),
+            ("2024-01-15", Some("2024-01-15")),
+            ("2024.1.15", Some("2024-01-15")),
+            ("15/01/2024", Some("2024-01-15")),
+            ("01/15/2024", Some("2024-01-15")),
+            ("2024-01-15 10:30:00", Some("2024-01-15T10:30:00")),
+            ("2024-01-15T10:30:00Z", Some("2024-01-15T10:30:00Z")),
+            ("2024-02-29", Some("2024-02-29")),
+            ("2023-02-29", None),
+            ("01/02/2024", None),
+            ("2024-13-45", None),
+            ("yesterday", None),
+            ("2024-01T10:00", None),
+        ] {
+            assert_eq!(normalize_date(raw).as_deref(), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn finalize_warns_about_svg_and_mathml_on_device_profiles() {
+        let md = path_str(&fixture("kitchen-sink.md"));
+        for profile in ["scribe", "remarkable", "remarkable-pro"] {
+            let (mut o, _) = resolve(
+                &cli(&[
+                    &md,
+                    "--profile",
+                    profile,
+                    "--svg",
+                    "keep",
+                    "--math",
+                    "mathml",
+                ]),
+                None,
+            )
+            .unwrap();
+            let w = finalize(&mut o);
+            assert_eq!(w.len(), 2, "{w:?}");
+            assert!(w[0].contains("SVG kept") && w[0].contains(profile), "{w:?}");
+            assert!(
+                w[1].contains("MathML") && w[1].contains("Send to Kindle"),
+                "{w:?}"
+            );
+        }
+        let (mut o, _) = resolve(&cli(&[&md, "--profile", "scribe"]), None).unwrap();
+        assert!(finalize(&mut o).is_empty());
+        let (mut o, _) = resolve(&cli(&[&md, "--svg", "keep", "--math", "mathml"]), None).unwrap();
+        assert!(finalize(&mut o).is_empty());
     }
 }

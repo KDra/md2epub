@@ -60,8 +60,13 @@ md2epub build book.toml
 If you leave out `-o`, the book is written to `<first-input-stem>.epub` in the current
 directory. Warnings, such as a missing image or a remote image skipped offline, are
 printed to stderr, and the book is still written. md2epub exits with a non-zero
-status only for fatal problems, such as a missing input file or a bad option. In that
+status only for fatal problems, such as a missing input file, a missing `--cover` or
+`--css` file, a bad option, or an `-o` path that would overwrite an input. In that
 case it leaves no partial EPUB behind.
+
+Inputs are read as UTF-8; UTF-16 files with a byte-order mark are converted, and other
+encodings produce a warning. `.xhtml` inputs are read with XML rules (CDATA sections,
+self-closed `<div/>`).
 
 ### Options
 
@@ -71,8 +76,8 @@ case it leaves no partial EPUB behind.
 | `--profile <NAME>` | `scribe`, `remarkable`, `remarkable-pro`, `generic` | `generic` | Target device (see below). |
 | `--title <TITLE>` | text | front matter, then first `<h1>`, then file name | Book title. |
 | `--author <NAME>` | text, repeatable | front matter | Author(s). |
-| `--lang <LANG>` | BCP 47 tag | `en` | Book language. |
-| `--cover <IMG>` | PNG, JPEG, SVG, WebP, ... | generated title page | Cover image. |
+| `--lang <LANG>` | BCP 47 tag | first HTML input's `<html lang>`, else `en` | Book language. `en_US` is normalized to `en-US`; an invalid tag falls back to `en` with a warning. |
+| `--cover <IMG>` | PNG, JPEG, SVG, WebP, ... | generated title page | Cover image (must exist). |
 | `--split-level <L>` | `1`, `2`, `none` | `1` | Start a new chapter (file) at each heading of this level. Each input file always starts a chapter. |
 | `--notes <WHERE>` | `none`, `after-chapter`, `end` | `none` | Insert full-page note pages. |
 | `--notes-style <S>` | `blank`, `lined`, `dotted`, `grid` | `lined` | Pattern on note pages. |
@@ -81,13 +86,18 @@ case it leaves no partial EPUB behind.
 | `--line-spacing <F>` | number, e.g. `1.6` | reader default | CSS `line-height`. |
 | `--math <MODE>` | `image`, `mathml`, `off` | `image` | Render math to images, convert to MathML, or keep the LaTeX source as code. |
 | `--svg <MODE>` | `rasterize`, `keep` | from profile | Rasterize SVG to PNG, or keep it as SVG. |
-| `--grayscale` | flag | off | Convert all images to grayscale. |
-| `--css <FILE>` | path | none | Extra CSS appended after the built-in stylesheet. |
-| `--offline` | flag | off | Do not download remote images (their alt text is kept). |
-| `-v, --verbose` | flag | off | Print progress and detailed diagnostics. |
+| `--grayscale` | flag | off | Convert all images to grayscale. `--no-grayscale` turns it off. |
+| `--css <FILE>` | path | none | Extra CSS appended after the built-in stylesheet. Fonts and images it references with `url(...)` (relative to the CSS file) are embedded. |
+| `--offline` | flag | off | Do not download remote images (their alt text is kept). `--no-offline` turns it off. |
+| `-v, --verbose` | flag | off | Print progress and detailed diagnostics. `--no-verbose` turns it off. |
 
 **Precedence:** command-line flags > `book.toml` > YAML front matter of the first input >
-profile defaults.
+profile defaults. The `--no-...` forms let a flag switch off a boolean that `book.toml`
+switches on.
+
+Front-matter and `book.toml` dates should be `YYYY`, `YYYY-MM` or `YYYY-MM-DD`;
+`2024/1/5` and unambiguous `DD/MM/YYYY` forms are converted, anything else is left out
+with a warning.
 
 ### Profiles
 
@@ -100,8 +110,12 @@ profile defaults.
 
 Under `scribe`, `remarkable` and `remarkable-pro`, the EPUB contains no `<svg>`, no
 `<math>`, no SVG files and no images with an alpha channel. Every image is an opaque
-PNG or a JPEG. You can still pass `--svg keep` or `--math mathml` explicitly. With
-`--profile scribe --math mathml`, md2epub warns that Send to Kindle may reject the book.
+PNG or a JPEG. MathML already in the input is rendered from its TeX annotation (or
+shown as text, with a warning), and CSS that e-ink readers lay out badly (flex and grid
+layout, fixed positioning, viewport units, opacity, filters) is removed from `style`
+attributes and `<style>` blocks, with a warning. You can still pass `--svg keep` or
+`--math mathml` explicitly; md2epub then warns that Send to Kindle or the reMarkable may
+reject or drop that content.
 
 ### Front matter
 
@@ -213,15 +227,19 @@ cargo build --release --no-default-features --features mermaid
   warning. Math images do not scale with the reader's font size the way text does.
 - **MathML and SVG** are not reliable through Send to Kindle, so the device profiles
   avoid both by default.
-- **External stylesheets** (`<link rel="stylesheet">`) in HTML inputs are ignored, with a
-  warning. Use `--css` instead. `<style>` blocks and `style` attributes are kept.
+- **External stylesheets** (`<link rel="stylesheet">` and `@import`) in HTML inputs are
+  ignored, with a warning. Use `--css` instead. `<style>` blocks and `style` attributes
+  are kept.
+- **Very large or deeply nested input** is refused: images over 100 megapixels are not
+  embedded, and documents nested more than 2000 elements deep stop with an error. A
+  formula or SVG that takes too long to render (20 s and 30 s) is skipped with a warning.
 - **JavaScript** in HTML inputs is removed. Pages that build their content with JavaScript
   convert to whatever static HTML they contain.
 - **Remote images** are fetched with a 20 s timeout and a 50 MB cap. With `--offline` they
   are skipped and their alt text is kept.
 - **CSS on e-ink readers:** flexbox, grid, fixed positioning and viewport units are
-  avoided in the built-in stylesheet. Custom CSS that uses them may render differently
-  on devices.
+  avoided in the built-in stylesheet and removed from input styles under the device
+  profiles. A `--css` file is used as written and may render differently on devices.
 - On-device behaviour (handwriting on the Scribe and the reMarkable) cannot be tested
   automatically. Please report problems with a sample file.
 

@@ -6,13 +6,25 @@
 //! 2. the margin preset (`normal` nothing, `wide` about 8% side padding,
 //!    `extra` about 15% side padding plus larger paragraph spacing),
 //! 3. `line_spacing` as `line-height`,
-//! 4. the user's `--css` file, appended verbatim so it wins the cascade.
+//! 4. the user's `--css` file, appended last so it wins the cascade.
+//!
+//! [`build_book_css`] (used by the pipeline) resolves the `url(...)`
+//! references of the user file against its directory and stores the fonts
+//! and images it names in the book (see `assets::rewrite_user_css`);
+//! [`build_css`] appends it verbatim.
+//!
+//! The margin presets pad `body`; note pages (`<body class="notes">`) are
+//! exempt so their page image keeps the full width.
 //!
 //! Errors if the user CSS file cannot be read or `line_spacing` is not a
 //! positive number.
 
+use std::path::Path;
+
 use anyhow::{Context as _, Result, bail};
 
+use crate::assets;
+use crate::ctx::Ctx;
 use crate::model::{Margin, Options};
 
 /// Built-in stylesheet.
@@ -23,8 +35,26 @@ pub const WIDE_SIDE_PERCENT: u32 = 8;
 /// Side padding (percent of the page width) for the `extra` preset.
 pub const EXTRA_SIDE_PERCENT: u32 = 15;
 
-/// Builds the book stylesheet. See the module docs.
+/// Builds the book stylesheet with the user CSS appended verbatim. See the
+/// module docs.
 pub fn build_css(opts: &Options) -> Result<String> {
+    build(opts, |css, _| css.to_string())
+}
+
+/// Builds the book stylesheet, resolving the user CSS's `url(...)`
+/// references into book resources (warnings go to `ctx`).
+pub fn build_book_css(ctx: &mut Ctx) -> Result<String> {
+    let opts = ctx.opts.clone();
+    build(&opts, |css, path| {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        };
+        assets::rewrite_user_css(css, &dir, ctx)
+    })
+}
+
+fn build(opts: &Options, mut user_css: impl FnMut(&str, &Path) -> String) -> Result<String> {
     let mut css = String::with_capacity(BASE_CSS.len() + 512);
     css.push_str(BASE_CSS);
     if !css.ends_with('\n') {
@@ -46,7 +76,7 @@ pub fn build_css(opts: &Options) -> Result<String> {
         // A UTF-8 BOM in the middle of the stylesheet would break the first rule.
         let user = user.trim_start_matches('\u{feff}');
         css.push_str(&format!("\n/* user stylesheet: {} */\n", file_label(path)));
-        css.push_str(user);
+        css.push_str(&user_css(user, path));
         if !css.ends_with('\n') {
             css.push('\n');
         }
@@ -54,13 +84,16 @@ pub fn build_css(opts: &Options) -> Result<String> {
     Ok(css)
 }
 
+/// Keeps note pages full width under a margin preset.
+const NOTES_RESET: &str = "body.notes {\n  margin: 0;\n  padding: 0;\n}\n";
+
 /// CSS for a margin preset, or `None` for `normal`.
 fn margin_css(margin: Margin) -> Option<String> {
     match margin {
         Margin::Normal => None,
         Margin::Wide => Some(format!(
             "\n/* margin preset: wide */\n\
-             body {{\n  padding-left: {p}%;\n  padding-right: {p}%;\n}}\n",
+             body {{\n  padding-left: {p}%;\n  padding-right: {p}%;\n}}\n{NOTES_RESET}",
             p = WIDE_SIDE_PERCENT
         )),
         Margin::Extra => Some(format!(
@@ -68,7 +101,7 @@ fn margin_css(margin: Margin) -> Option<String> {
              body {{\n  padding-left: {p}%;\n  padding-right: {p}%;\n}}\n\
              p {{\n  margin-bottom: 1.4em;\n}}\n\
              li {{\n  margin-bottom: 0.6em;\n}}\n\
-             h1,\nh2,\nh3,\nh4,\nh5,\nh6 {{\n  margin-top: 1.6em;\n  margin-bottom: 0.8em;\n}}\n",
+             h1,\nh2,\nh3,\nh4,\nh5,\nh6 {{\n  margin-top: 1.6em;\n  margin-bottom: 0.8em;\n}}\n{NOTES_RESET}",
             p = EXTRA_SIDE_PERCENT
         )),
     }
@@ -236,6 +269,65 @@ mod tests {
         };
         let err = build_css(&opts).unwrap_err().to_string();
         assert!(err.contains("does-not-exist.css"), "{err}");
+    }
+
+    #[test]
+    fn margin_presets_exempt_note_pages() {
+        for m in [Margin::Wide, Margin::Extra] {
+            let css = build_css(&opts_with_margin(m)).unwrap();
+            let preset = css.find("margin preset").unwrap();
+            let reset = css
+                .find("body.notes {\n  margin: 0;\n  padding: 0;")
+                .unwrap();
+            assert!(preset < reset, "{m:?}");
+        }
+    }
+
+    #[test]
+    fn user_css_urls_become_book_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(fixture("images/chart.png"), dir.path().join("p.png")).unwrap();
+        std::fs::create_dir(dir.path().join("fonts")).unwrap();
+        std::fs::write(dir.path().join("fonts/f.woff2"), b"wOF2fakefontdata").unwrap();
+        let path = dir.path().join("user.css");
+        std::fs::write(
+            &path,
+            "@font-face { font-family: F; src: url(fonts/f.woff2) format(\"woff2\"); }\n\
+             body { background: url(p.png); }\n\
+             .b { list-style-image: url(\"missing.png\"); }\n\
+             /* url(p.png) in a comment */\n",
+        )
+        .unwrap();
+        let mut ctx = Ctx::new(Options {
+            extra_css: Some(path),
+            ..Options::default()
+        });
+        let css = build_book_css(&mut ctx).unwrap();
+        let hrefs: Vec<&str> = ctx.resources().iter().map(|r| r.href.as_str()).collect();
+        assert_eq!(hrefs.len(), 2, "{hrefs:?}");
+        assert!(
+            hrefs
+                .iter()
+                .any(|h| h.starts_with("fonts/") && h.ends_with(".woff2"))
+        );
+        assert!(
+            hrefs
+                .iter()
+                .any(|h| h.starts_with("images/") && h.ends_with(".png"))
+        );
+        for h in &hrefs {
+            assert!(
+                css.contains(&format!("url(\"../{h}\")")),
+                "{h} not referenced:\n{css}"
+            );
+        }
+        assert!(css.contains("list-style-image: none"), "{css}");
+        assert!(css.contains("/* url(p.png) in a comment */"), "{css}");
+        assert_eq!(ctx.warnings().len(), 1, "{:?}", ctx.warnings());
+        assert!(ctx.warnings()[0].contains("missing.png"));
+        // The plain variant keeps the text verbatim.
+        let plain = build_css(&ctx.opts).unwrap();
+        assert!(plain.contains("url(p.png)"));
     }
 
     #[test]

@@ -190,7 +190,8 @@ fn element_attrs(tag: &str) -> &'static [&'static str] {
         "ol" => &["start", "reversed", "type"],
         "li" => &["value"],
         "td" => &["colspan", "rowspan", "headers"],
-        "th" => &["colspan", "rowspan", "headers", "scope", "abbr"],
+        // `abbr` is not allowed on `th` by the EPUB XHTML schema.
+        "th" => &["colspan", "rowspan", "headers", "scope"],
         "col" | "colgroup" => &["span"],
         "blockquote" | "q" => &["cite"],
         "del" | "ins" => &["cite", "datetime"],
@@ -332,7 +333,10 @@ fn attr_fate(tag: &str, name: &str, value: &str) -> AttrFate {
                 _ => AttrFate::Drop,
             };
         }
-        "lang" | "xml:lang" | "class" | "role" if v.is_empty() => return AttrFate::Drop,
+        "lang" | "xml:lang" | "class" | "role" | "epub:type" if v.is_empty() => {
+            return AttrFate::Drop;
+        }
+        "epub:type" => return AttrFate::Keep,
         _ => {}
     }
     if GLOBAL_ATTRS.contains(&name) {
@@ -412,8 +416,45 @@ fn attr_fate(tag: &str, name: &str, value: &str) -> AttrFate {
             }
         }
         "href" if v.is_empty() => AttrFate::Drop,
+        "href" | "src" | "cite" => {
+            let encoded = encode_url(value);
+            if encoded == value {
+                AttrFate::Keep
+            } else {
+                AttrFate::Set(encoded)
+            }
+        }
         _ => AttrFate::Keep,
     }
+}
+
+/// Percent-encodes the characters a URL may not contain literally (spaces,
+/// quotes, `<`, `>`, `\`, `^`, `` ` ``, `{`, `|`, `}`, controls) and a `%`
+/// that does not start an escape. Leading and trailing whitespace is
+/// removed. Non-ASCII characters are allowed (IRIs) and kept.
+pub fn encode_url(value: &str) -> String {
+    let v = value.trim_matches(|c: char| c.is_ascii_whitespace());
+    let b = v.as_bytes();
+    let mut out = String::with_capacity(v.len());
+    for (i, c) in v.char_indices() {
+        let escape = match c {
+            ' ' | '"' | '<' | '>' | '\\' | '^' | '`' | '{' | '|' | '}' => true,
+            '%' => {
+                !(b.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+                    && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit))
+            }
+            c => c.is_control(),
+        };
+        if escape {
+            let mut buf = [0u8; 4];
+            for byte in c.encode_utf8(&mut buf).bytes() {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn is_script_url_in_css(lower_css: &str) -> bool {
@@ -428,11 +469,270 @@ fn is_script_url_in_css(lower_css: &str) -> bool {
 /// Cleans the parsed document in place. See the module docs.
 pub fn sanitize(doc: &Handle, ctx: &mut Ctx) -> Result<()> {
     take_title_hint(doc, ctx);
+    take_lang(doc, ctx);
     let body = dom::body(doc).unwrap_or_else(|| doc.clone());
     hoist_head(doc, &body, ctx);
     clean_children(&body, ctx);
     assign_ids(&body, ctx);
+    footnote_semantics(&body);
+    if ctx.opts.profile.flatten_alpha {
+        filter_device_css(&body, ctx);
+    }
     Ok(())
+}
+
+/// Records the document's `<html lang>` (normalized, when it is a valid
+/// tag) as the input language, and makes it the book language when it comes
+/// from the first input and no language was configured.
+fn take_lang(doc: &Handle, ctx: &mut Ctx) {
+    let lang = dom::first_by_tag(doc, "html")
+        .and_then(|h| dom::get_attr(&h, "lang").or_else(|| dom::get_attr(&h, "xml:lang")))
+        .filter(|l| !l.trim().is_empty());
+    let lang = match lang {
+        Some(raw) => {
+            let norm = crate::config::normalize_lang(&raw);
+            if norm.is_none() {
+                ctx.warn(format!(
+                    "{}: invalid language tag '{}' on <html> ignored",
+                    ctx.current_input.display(),
+                    raw.trim()
+                ));
+            }
+            norm
+        }
+        None => None,
+    };
+    if let Some(l) = &lang
+        && !ctx.opts.lang_given
+        && ctx.chapter_count == 0
+    {
+        ctx.opts.meta.lang = l.clone();
+        ctx.opts.lang_given = true;
+    }
+    ctx.input_lang = lang;
+}
+
+/// Adds EPUB and DPUB-ARIA semantics to comrak's footnote markup, so
+/// readers can show notes as pop-ups: `epub:type="noteref"` on references,
+/// `endnotes`/`endnote` on the notes section and its items, `doc-backlink`
+/// on the back references (whose arrow gets U+FE0E so it renders as text).
+fn footnote_semantics(root: &Handle) {
+    for el in html_elements(root) {
+        if dom::is_tag(&el, "a") {
+            if dom::has_attr(&el, "data-footnote-ref") {
+                dom::set_attr(&el, "epub:type", "noteref");
+                dom::set_attr(&el, "role", "doc-noteref");
+            } else if dom::has_attr(&el, "data-footnote-backref")
+                || dom::has_class(&el, "footnote-backref")
+            {
+                dom::set_attr(&el, "role", "doc-backlink");
+                for t in dom::descendants(&el) {
+                    if dom::is_text(&t) {
+                        let text = dom::text_content(&t);
+                        if text.contains('\u{21A9}') && !text.contains("\u{21A9}\u{FE0E}") {
+                            let new = text.replace('\u{21A9}', "\u{21A9}\u{FE0E}");
+                            dom::replace_with(&t, &dom::create_text(&new));
+                        }
+                    }
+                }
+            }
+        } else if dom::is_tag(&el, "section")
+            && (dom::has_class(&el, "footnotes") || dom::has_attr(&el, "data-footnotes"))
+        {
+            dom::set_attr(&el, "epub:type", "endnotes");
+            dom::set_attr(&el, "role", "doc-endnotes");
+            for list in dom::children(&el) {
+                if !(dom::is_tag(&list, "ol") || dom::is_tag(&list, "ul")) {
+                    continue;
+                }
+                for li in dom::children(&list) {
+                    if dom::is_tag(&li, "li") {
+                        dom::set_attr(&li, "epub:type", "endnote");
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Device CSS
+// ---------------------------------------------------------------------------
+
+/// Removes CSS that e-ink readers lay out badly or not at all (flex and grid
+/// layout, fixed/sticky positioning, viewport units, opacity, filters and
+/// blend modes) from `style` attributes and `<style>` elements, and warns
+/// once with the number of declarations removed.
+fn filter_device_css(root: &Handle, ctx: &mut Ctx) {
+    let mut dropped = 0;
+    for el in html_elements(root) {
+        if dom::is_tag(&el, "style") {
+            let css = dom::text_content(&el);
+            let (new, n) = filter_css(&css, true);
+            if n > 0 {
+                dom::set_text(&el, &new);
+                dropped += n;
+            }
+        }
+        if let Some(style) = dom::get_attr(&el, "style") {
+            let (new, n) = filter_css(&style, false);
+            if n > 0 {
+                dropped += n;
+                if new.trim().is_empty() {
+                    dom::remove_attr(&el, "style");
+                } else {
+                    dom::set_attr(&el, "style", new.trim());
+                }
+            }
+        }
+    }
+    if dropped > 0 {
+        ctx.warn(format!(
+            "{}: removed {dropped} CSS declaration{} that e-ink readers do not support \
+             (flex/grid layout, fixed positioning, viewport units, opacity, filters)",
+            ctx.current_input.display(),
+            if dropped == 1 { "" } else { "s" }
+        ));
+    }
+}
+
+/// Whether a CSS declaration is unsupported on the device profiles.
+fn unsupported_declaration(prop: &str, value: &str) -> bool {
+    let prop = prop.trim().to_ascii_lowercase();
+    if prop.starts_with("--") {
+        return false;
+    }
+    let value = value.to_ascii_lowercase();
+    let value = value.replace("!important", "");
+    let value = value.trim();
+    match prop.as_str() {
+        "display" if ["flex", "inline-flex", "grid", "inline-grid"].contains(&value) => {
+            return true;
+        }
+        "position" if ["fixed", "sticky", "-webkit-sticky"].contains(&value) => return true,
+        "opacity" | "filter" | "-webkit-filter" | "backdrop-filter" | "mix-blend-mode" => {
+            return true;
+        }
+        _ => {}
+    }
+    has_viewport_unit(value)
+}
+
+/// Whether a CSS value uses a viewport-relative length (`50vw`, `1vmin`).
+fn has_viewport_unit(value: &str) -> bool {
+    const UNITS: &[&str] = &[
+        "vmin", "vmax", "dvw", "dvh", "svw", "svh", "lvw", "lvh", "vw", "vh", "vi", "vb",
+    ];
+    let b = value.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() || (b[i] == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            let rest = &value[i..];
+            for u in UNITS {
+                if rest.starts_with(u)
+                    && !rest[u.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-')
+                {
+                    return true;
+                }
+            }
+        } else if b[i].is_ascii_alphabetic() || b[i] == b'-' || b[i] == b'_' {
+            // Skip identifiers so `h1` or `var(--x2vw)` are not numbers.
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'-' || b[i] == b'_') {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Removes unsupported declarations from CSS text. `sheet` is true for a
+/// style sheet (rules with blocks) and false for a `style` attribute (a bare
+/// declaration list). Comments and strings are respected. Returns the new
+/// text and the number of declarations removed.
+fn filter_css(css: &str, sheet: bool) -> (String, usize) {
+    let mut out = String::with_capacity(css.len());
+    let mut dropped = 0;
+    let mut depth: usize = 0;
+    let mut seg_start = 0;
+    let mut paren = 0usize;
+    let b = css.as_bytes();
+    let mut i = 0;
+    let flush =
+        |seg: &str, delim: Option<u8>, depth: usize, out: &mut String, dropped: &mut usize| {
+            let is_decl = (!sheet || depth > 0) && delim != Some(b'{');
+            if is_decl
+                && let Some((prop, value)) = seg.split_once(':')
+                && unsupported_declaration(&strip_css_comments(prop), value)
+            {
+                *dropped += 1;
+                // Keep the whitespace before the declaration; drop it and its `;`.
+                let lead = seg.len() - seg.trim_start().len();
+                out.push_str(&seg[..lead]);
+                if delim == Some(b'}') {
+                    out.push('}');
+                }
+                return;
+            }
+            out.push_str(seg);
+            if let Some(d) = delim {
+                out.push(d as char);
+            }
+        };
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i = css[i + 2..].find("*/").map_or(b.len(), |e| i + 2 + e + 2);
+                continue;
+            }
+            q @ (b'"' | b'\'') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            b'(' => paren += 1,
+            b')' => paren = paren.saturating_sub(1),
+            d @ (b';' | b'{' | b'}') if paren == 0 => {
+                let seg = &css[seg_start..i];
+                flush(seg, Some(d), depth, &mut out, &mut dropped);
+                match d {
+                    b'{' => depth += 1,
+                    b'}' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+                seg_start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if seg_start < css.len() {
+        flush(&css[seg_start..], None, depth, &mut out, &mut dropped);
+    }
+    (out, dropped)
+}
+
+fn strip_css_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("/*") {
+        out.push_str(&rest[..i]);
+        rest = rest[i + 2..]
+            .find("*/")
+            .map_or("", |e| &rest[i + 2 + e + 2..]);
+    }
+    out.push_str(rest);
+    out
 }
 
 fn is_html(node: &Handle) -> bool {
@@ -538,6 +838,9 @@ fn clean_element(el: &Handle, ctx: &mut Ctx) {
             dom::remove(el);
         }
         Action::Unwrap => {
+            if tag == "picture" {
+                carry_picture_sources(el);
+            }
             clean_children(el, ctx);
             dom::unwrap(el);
         }
@@ -556,9 +859,45 @@ fn clean_element(el: &Handle, ctx: &mut Ctx) {
             clean_element(&new, ctx);
         }
         Action::Keep => {
+            if tag == "img"
+                && let Some(srcset) = dom::get_attr(el, "srcset").filter(|s| !s.trim().is_empty())
+            {
+                dom::set_attr(el, SRCSET_ATTR, srcset.trim());
+            }
             clean_html_attrs(el, &tag);
+            if tag == "area" && !dom::has_attr(el, "alt") {
+                dom::set_attr(el, "alt", "");
+            }
             clean_children(el, ctx);
         }
+    }
+}
+
+/// Attribute where [`sanitize`] keeps an `<img>`'s `srcset` (which is not
+/// valid EPUB XHTML) for `assets::transform`, which uses its candidates
+/// when `src` is missing or cannot be loaded, and then removes it.
+pub const SRCSET_ATTR: &str = "data-md2epub-srcset";
+
+/// Attribute where [`sanitize`] keeps the `srcset` values of a `<picture>`'s
+/// `<source>` elements (one per line, in document order) on its `<img>`,
+/// as further fallbacks for `assets::transform`.
+pub const SOURCES_ATTR: &str = "data-md2epub-sources";
+
+/// Copies the `srcset` of a `<picture>`'s `<source>` children onto its
+/// `<img>` (see [`SOURCES_ATTR`]) before the sources are removed.
+fn carry_picture_sources(picture: &Handle) {
+    let sources: Vec<String> = dom::children(picture)
+        .into_iter()
+        .filter(|c| dom::is_tag(c, "source"))
+        .filter_map(|c| dom::get_attr(&c, "srcset").or_else(|| dom::get_attr(&c, "src")))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if sources.is_empty() {
+        return;
+    }
+    if let Some(img) = dom::first_by_tag(picture, "img") {
+        dom::set_attr(&img, SOURCES_ATTR, &sources.join("\n"));
     }
 }
 
@@ -610,6 +949,11 @@ fn clean_foreign(el: &Handle, ctx: &mut Ctx) {
         let url_attr = lname == "href" || lname.ends_with(":href") || lname == "src";
         if lname.starts_with("on") || (url_attr && is_script_url(&value)) {
             dom::remove_attr(el, &name);
+        } else if url_attr {
+            let encoded = encode_url(&value);
+            if encoded != value {
+                dom::set_attr(el, &name, &encoded);
+            }
         }
     }
     for child in dom::children(el) {
@@ -719,6 +1063,7 @@ fn assign_ids(root: &Handle, ctx: &mut Ctx) {
             }
         }
     }
+    fix_label_targets(root, &renamed);
     if renamed.iter().all(|(k, v)| k == v) {
         return;
     }
@@ -735,6 +1080,34 @@ fn assign_ids(root: &Handle, ctx: &mut Ctx) {
             && new != frag
         {
             dom::set_attr(&el, "href", &format!("#{new}"));
+        }
+    }
+}
+
+/// Keeps `<label for>` only when it names a labelable element of the same
+/// document (following renamed ids); a dangling `for` is invalid XHTML.
+fn fix_label_targets(root: &Handle, renamed: &HashMap<String, String>) {
+    const LABELABLE: &[&str] = &[
+        "button", "input", "meter", "output", "progress", "select", "textarea",
+    ];
+    let elements = html_elements(root);
+    let labelable: HashSet<String> = elements
+        .iter()
+        .filter(|e| LABELABLE.iter().any(|t| dom::is_tag(e, t)))
+        .filter_map(|e| dom::get_attr(e, "id"))
+        .collect();
+    for label in elements.iter().filter(|e| dom::is_tag(e, "label")) {
+        let Some(target) = dom::get_attr(label, "for") else {
+            continue;
+        };
+        let target = target.trim();
+        let mapped = renamed.get(target).map(String::as_str).unwrap_or(target);
+        if labelable.contains(mapped) {
+            if mapped != target {
+                dom::set_attr(label, "for", mapped);
+            }
+        } else {
+            dom::remove_attr(label, "for");
         }
     }
 }
@@ -817,6 +1190,107 @@ fn heading_text(node: &Handle) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// XHTML input
+// ---------------------------------------------------------------------------
+
+/// Whether an HTML input is really XML (XHTML): a `.xhtml` file, or one
+/// starting with an XML declaration.
+pub fn is_xhtml_input(path: &Path, text: &str) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("xhtml"))
+        || text
+            .trim_start_matches('\u{feff}')
+            .trim_start()
+            .starts_with("<?xml")
+}
+
+/// HTML void elements (self-closing is fine for these in HTML parsing).
+const HTML_VOID: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "keygen", "link", "meta", "param",
+    "source", "track", "wbr",
+];
+
+/// Rewrites XHTML so the HTML parser reads it as an XML parser would:
+/// `<![CDATA[...]]>` sections become escaped text (inside `<style>` and
+/// `<script>` only the markers are removed) and self-closed non-void
+/// elements (`<div/>`) get an end tag.
+pub fn xhtml_to_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut rest = text;
+    while let Some(pos) = rest.find('<') {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos..];
+        if let Some(after) = tail.strip_prefix("<!--") {
+            let end = after.find("-->").map_or(tail.len(), |e| 4 + e + 3);
+            out.push_str(&tail[..end]);
+            rest = &tail[end..];
+            continue;
+        }
+        if let Some(after) = tail.strip_prefix("<![CDATA[") {
+            let (inner, end) = match after.find("]]>") {
+                Some(e) => (&after[..e], 9 + e + 3),
+                None => (after, tail.len()),
+            };
+            out.push_str(
+                &inner
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;"),
+            );
+            rest = &tail[end..];
+            continue;
+        }
+        if tail.starts_with("<!") || tail.starts_with("<?") || tail.starts_with("</") {
+            let end = tail.find('>').map_or(tail.len(), |e| e + 1);
+            out.push_str(&tail[..end]);
+            rest = &tail[end..];
+            continue;
+        }
+        let Some(end) = find_tag_end(tail) else {
+            out.push_str(tail);
+            return out;
+        };
+        let raw = &tail[..end];
+        let name: String = raw[1..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '/' && *c != '>')
+            .collect();
+        let local = name
+            .rsplit(':')
+            .next()
+            .unwrap_or(&name)
+            .to_ascii_lowercase();
+        rest = &tail[end..];
+        if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            out.push_str(raw);
+            continue;
+        }
+        let self_closed = raw.ends_with("/>");
+        if self_closed && !HTML_VOID.contains(&local.as_str()) {
+            out.push_str(raw[..raw.len() - 2].trim_end());
+            out.push_str("></");
+            out.push_str(&name);
+            out.push('>');
+            continue;
+        }
+        out.push_str(raw);
+        if !self_closed && (local == "style" || local == "script") {
+            // Raw text: copy up to the end tag, unwrapping CDATA markers.
+            let close = format!("</{name}");
+            let lower = rest.to_ascii_lowercase();
+            let stop = lower
+                .find(&close.to_ascii_lowercase())
+                .unwrap_or(rest.len());
+            let content = &rest[..stop];
+            out.push_str(&content.replace("<![CDATA[", "").replace("]]>", ""));
+            rest = &rest[stop..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Splitting
 // ---------------------------------------------------------------------------
 
@@ -886,10 +1360,20 @@ pub fn split(doc: &Handle, ctx: &mut Ctx) -> Result<Vec<Chapter>> {
         .map(|s| s.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty());
 
+    // An input whose language differs from the book's keeps it on a wrapper.
+    let lang_wrapper = ctx
+        .input_lang
+        .clone()
+        .filter(|l| !l.eq_ignore_ascii_case(&ctx.opts.meta.lang));
+
     let mut chapters = Vec::with_capacity(groups.len());
     for group in groups {
         let mut headings = Vec::new();
         let mut body_xhtml = style_xhtml.clone();
+        if let Some(l) = &lang_wrapper {
+            let l = dom::escape(l);
+            body_xhtml.push_str(&format!("<div lang=\"{l}\" xml:lang=\"{l}\">"));
+        }
         for node in &group {
             if let Some(level) = heading_level(node) {
                 headings.push(make_heading(node, level));
@@ -902,6 +1386,9 @@ pub fn split(doc: &Handle, ctx: &mut Ctx) -> Result<Vec<Chapter>> {
                 }
             }
             body_xhtml.push_str(&dom::serialize_xhtml(node));
+        }
+        if lang_wrapper.is_some() {
+            body_xhtml.push_str("</div>");
         }
         if ctx.title_hint.is_none()
             && let Some(h1) = headings.iter().find(|h| h.level == 1 && !h.text.is_empty())
@@ -1045,7 +1532,15 @@ pub fn fix_links(chapters: &mut [Chapter]) {
 /// Like [`fix_links`], and returns a warning for every internal link that
 /// had no target in the book (its `href` was removed).
 pub fn fix_links_with_warnings(chapters: &mut [Chapter]) -> Vec<String> {
-    let index = LinkIndex::build(chapters);
+    fix_links_with_resources(chapters, &[])
+}
+
+/// Like [`fix_links_with_warnings`], also accepting parent-relative links
+/// (`../images/x.png`) that name one of the book `resources` (hrefs
+/// relative to `OEBPS/`, e.g. `images/ab12.png`).
+pub fn fix_links_with_resources(chapters: &mut [Chapter], resources: &[String]) -> Vec<String> {
+    let mut index = LinkIndex::build(chapters);
+    index.resources = resources.iter().cloned().collect();
     let mut warnings = Vec::new();
     let mut seen_warnings = HashSet::new();
     for (i, chapter) in chapters.iter_mut().enumerate() {
@@ -1079,6 +1574,17 @@ pub fn fix_links_with_warnings(chapters: &mut [Chapter]) -> Vec<String> {
                             }
                             drop_href = true;
                         }
+                        Resolved::Unsupported(scheme) => {
+                            let msg = format!(
+                                "{}: '{scheme}:' link '{}' is not allowed in an EPUB; link removed",
+                                index.source_label(i),
+                                shorten_href(v)
+                            );
+                            if seen_warnings.insert(msg.clone()) {
+                                warnings.push(msg);
+                            }
+                            drop_href = true;
+                        }
                     }
                 }
                 if drop_href {
@@ -1100,6 +1606,26 @@ enum Resolved {
     Keep,
     Rewrite(String),
     Broken,
+    /// A URL scheme readers cannot follow (`data:`, `blob:`, ...).
+    Unsupported(String),
+}
+
+/// URL schemes kept on links. `file:` links are mapped to chapters, and
+/// every other scheme is removed (EPUB forbids `file:` and `data:` links,
+/// and readers cannot follow `blob:`, `about:`, `chrome:`, ...).
+const LINK_SCHEMES: &[&str] = &[
+    "http", "https", "mailto", "tel", "sms", "ftp", "ftps", "news", "nntp", "irc", "ircs", "geo",
+    "urn", "doi", "isbn",
+];
+
+/// A long href shortened for warnings (data URIs can be huge).
+fn shorten_href(href: &str) -> String {
+    const MAX: usize = 60;
+    if href.chars().count() <= MAX {
+        href.to_string()
+    } else {
+        format!("{}...", href.chars().take(MAX).collect::<String>())
+    }
 }
 
 struct LinkIndex {
@@ -1113,6 +1639,8 @@ struct LinkIndex {
     orig_ids: HashMap<(PathBuf, String), (usize, String)>,
     /// Source key -> first chapter index.
     first_chapter: HashMap<PathBuf, usize>,
+    /// Book resource hrefs relative to `OEBPS/` (`images/ab.png`).
+    resources: HashSet<String>,
 }
 
 impl LinkIndex {
@@ -1127,6 +1655,7 @@ impl LinkIndex {
             ids: HashMap::new(),
             orig_ids: HashMap::new(),
             first_chapter: HashMap::new(),
+            resources: HashSet::new(),
         };
         for (i, ch) in chapters.iter().enumerate() {
             if let Some(key) = &idx.source_keys[i] {
@@ -1212,8 +1741,18 @@ impl LinkIndex {
             }
             return Resolved::Broken;
         }
-        if has_scheme(href_t) || href_t.starts_with("//") {
+        if href_t.starts_with("//") {
             return Resolved::Keep;
+        }
+        if has_scheme(href_t) {
+            let scheme = href_t[..href_t.find(':').unwrap_or(0)].to_ascii_lowercase();
+            if scheme == "file" {
+                return self.resolve_file_url(from, href_t);
+            }
+            if LINK_SCHEMES.contains(&scheme.as_str()) {
+                return Resolved::Keep;
+            }
+            return Resolved::Unsupported(scheme);
         }
         let (path_part, frag) = match href_t.split_once('#') {
             Some((p, f)) => (p, Some(f)),
@@ -1235,18 +1774,80 @@ impl LinkIndex {
             .unwrap_or_default();
         let target = base.join(&path);
         let Some(key) = self.match_source(&target) else {
-            // Already-resolved chapter links (`ch002.xhtml#x`) and book
-            // resources stay as they are.
-            if self.files.iter().any(|f| f == &path) || path.starts_with("../") {
+            // Already-resolved chapter links (`ch002.xhtml#x`) and links to
+            // book resources (`../images/x.png`) stay as they are.
+            if self.files.iter().any(|f| f == &path) || self.is_book_file(&path) {
                 return Resolved::Keep;
             }
             return Resolved::Broken;
         };
-        let Some(&first) = self.first_chapter.get(&key) else {
+        self.link_to_source(from, &key, frag)
+    }
+
+    /// Whether `path` (relative to `OEBPS/text/`) names a chapter or a book
+    /// resource.
+    fn is_book_file(&self, path: &str) -> bool {
+        let mut parts: Vec<&str> = vec!["text"];
+        for seg in path.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    if parts.pop().is_none() {
+                        return false;
+                    }
+                }
+                s => parts.push(s),
+            }
+        }
+        let joined = parts.join("/");
+        if let Some(name) = joined.strip_prefix("text/") {
+            return self.files.iter().any(|f| f == name);
+        }
+        self.resources.contains(&joined)
+    }
+
+    /// A `file:` URL: links to an input file map to its chapter like a
+    /// relative link; anything else is broken (a local path means nothing
+    /// on a reader and EPUB forbids `file:` URLs).
+    fn resolve_file_url(&self, from: usize, href: &str) -> Resolved {
+        let rest = &href[5..];
+        let (path_part, frag) = match rest.split_once('#') {
+            Some((p, f)) => (p, Some(f)),
+            None => (rest, None),
+        };
+        let path_part = path_part.split('?').next().unwrap_or("");
+        let path = match path_part.strip_prefix("//") {
+            Some(after) => {
+                let (host, p) = after.split_at(after.find('/').unwrap_or(after.len()));
+                if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
+                    return Resolved::Broken;
+                }
+                p
+            }
+            None => path_part,
+        };
+        let mut decoded = percent_decode(path);
+        // file:///C:/dir -> C:/dir
+        let b = decoded.as_bytes();
+        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+            decoded.remove(0);
+        }
+        if decoded.is_empty() {
+            return Resolved::Broken;
+        }
+        match self.match_source(Path::new(&decoded)) {
+            Some(key) => self.link_to_source(from, &key, frag),
+            None => Resolved::Broken,
+        }
+    }
+
+    /// A link to the input file `key`, optionally to an element in it.
+    fn link_to_source(&self, from: usize, key: &Path, frag: Option<&str>) -> Resolved {
+        let Some(&first) = self.first_chapter.get(key) else {
             return Resolved::Broken;
         };
         match frag.map(percent_decode).filter(|f| !f.is_empty()) {
-            Some(f) => match self.find_in_source(&key, &f) {
+            Some(f) => match self.find_in_source(key, &f) {
                 Some((to, id)) => Resolved::Rewrite(self.link_to(from, to, Some(&id))),
                 None => Resolved::Rewrite(self.files[first].clone()),
             },
@@ -1654,7 +2255,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains(r#"<img src="a.png" height="20" style="float: left; width: 50%"/>"#),
+            out.contains(r#"<img src="a.png" height="20" data-md2epub-srcset="b.png 2x" style="float: left; width: 50%"/>"#),
             "{out}"
         );
         assert!(
@@ -1699,9 +2300,22 @@ mod tests {
         assert!(out.contains(r#"<span data-math-style="inline">x^2</span>"#));
         assert!(out.contains(r#"<pre class="mermaid">graph TD; A--&gt;B</pre>"#));
         assert!(out.contains(r#"<pre style="background-color:#fff;">"#));
-        assert!(out.contains(r##"<a href="#fn-1" id="fnref-1" data-footnote-ref="">1</a>"##));
+        assert!(out.contains(r##"<a href="#fn-1" id="fnref-1" data-footnote-ref="" xmlns:epub="http://www.idpf.org/2007/ops" epub:type="noteref" role="doc-noteref">1</a>"##), "{out}");
         assert!(out.contains(r#"class="task-list-item-checkbox""#));
-        assert!(out.contains(r#"<li id="fn-1">"#));
+        assert!(
+            out.contains(
+                r#"<li id="fn-1" xmlns:epub="http://www.idpf.org/2007/ops" epub:type="endnote">"#
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"epub:type="endnotes" role="doc-endnotes""#),
+            "{out}"
+        );
+        assert!(
+            out.contains("role=\"doc-backlink\">\u{21A9}\u{FE0E}</a>"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -2079,5 +2693,263 @@ mod tests {
         for c in &chapters {
             assert_well_formed(&c.body_xhtml);
         }
+    }
+
+    #[test]
+    fn invalid_raw_html_is_repaired() {
+        let out = sanitized_body(
+            r#"<p><a href="https://e.x/a b">sp</a> <a href=" x.html?q=a|b ">q</a>
+            <a href="50%off.html">pct</a> <a href="a%20b.html">ok</a>
+            <img src="sub\ab.png" alt="bs"></p>
+            <map name="m"><area shape="rect" coords="0,0,1,1" href="https://e.x/"></map>
+            <table><tr><th abbr="x" scope="col">h</th><td abbr="y">d</td></tr></table>
+            <label for="nobody">dangling</label><label for="in">ok</label><input id="in">
+            <label for="p1">not labelable</label><p id="p1">p</p>"#,
+        );
+        assert!(out.contains(r#"href="https://e.x/a%20b""#), "{out}");
+        assert!(out.contains(r#"href="x.html?q=a%7Cb""#), "{out}");
+        assert!(out.contains(r#"href="50%25off.html""#), "{out}");
+        assert!(out.contains(r#"href="a%20b.html""#), "{out}");
+        assert!(out.contains(r#"src="sub%5Cab.png""#), "{out}");
+        assert!(out.contains(r#"alt="""#) && out.contains("<area"), "{out}");
+        let area = &out[out.find("<area").unwrap()..];
+        assert!(
+            area[..area.find("/>").unwrap()].contains("alt=\"\""),
+            "{out}"
+        );
+        assert!(!out.contains("abbr="), "{out}");
+        assert!(out.contains("<label>dangling</label>"), "{out}");
+        assert!(out.contains(r#"<label for="in">ok</label>"#), "{out}");
+        assert!(out.contains("<label>not labelable</label>"), "{out}");
+        assert_eq!(encode_url("a b\"c<d>"), "a%20b%22c%3Cd%3E");
+        assert_eq!(encode_url("%41%zz%"), "%41%25zz%25");
+        assert_eq!(encode_url("üml"), "üml");
+    }
+
+    #[test]
+    fn label_targets_follow_renamed_ids() {
+        let mut ctx = ctx_with(None, "a.html");
+        ctx.unique_id("q");
+        let doc = dom::parse(r#"<label for="q">l</label><input id="q">"#);
+        sanitize(&doc, &mut ctx).unwrap();
+        let out = dom::serialize_inner_xhtml(&dom::body(&doc).unwrap());
+        assert!(
+            out.contains(r#"<label for="q-2">l</label><input id="q-2""#),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn epub_type_from_input_is_kept() {
+        let out = sanitized_body(r#"<aside epub:type="footnote" id="n">note</aside>"#);
+        assert!(out.contains(r#"epub:type="footnote""#), "{out}");
+    }
+
+    #[test]
+    fn device_profiles_drop_unsupported_css() {
+        let html = r#"<style>.x{display:grid} .y { height: 100vh; color: red } @media print { .z { display: flex; margin: 0 } } a:hover { opacity: .5 }</style>
+            <div style="display:flex;position:fixed;width:50vw;color:blue">d</div>
+            <p style="opacity:0.5">o</p><p style="--w: 3vw; margin: 1vmin 2em">m</p>
+            <svg xmlns="http://www.w3.org/2000/svg"><rect style="opacity:0.5" width="1" height="1"/></svg>"#;
+        let mut ctx = ctx_with(None, "c.html");
+        ctx.opts.profile = crate::profile::by_name("scribe").unwrap();
+        let doc = dom::parse(html);
+        sanitize(&doc, &mut ctx).unwrap();
+        let out = dom::serialize_inner_xhtml(&dom::body(&doc).unwrap());
+        assert_well_formed(&out);
+        for gone in [
+            "grid",
+            "100vh",
+            "display: flex",
+            "display:flex",
+            "fixed",
+            "50vw",
+            "1vmin",
+            "opacity: .5",
+        ] {
+            assert!(!out.contains(gone), "{gone} left in {out}");
+        }
+        assert!(out.contains(".x{}"), "{out}");
+        assert!(out.contains("color: red"), "{out}");
+        assert!(out.contains("margin: 0"), "{out}");
+        assert!(out.contains(r#"style="color:blue""#), "{out}");
+        assert!(out.contains("<p>o</p>"), "{out}");
+        assert!(out.contains("--w: 3vw"), "{out}");
+        // SVG keeps its own opacity.
+        assert!(out.contains(r#"style="opacity:0.5""#), "{out}");
+        assert_eq!(ctx.warnings().len(), 1, "{:?}", ctx.warnings());
+        assert!(
+            ctx.warnings()[0].contains("removed 9 CSS declarations"),
+            "{:?}",
+            ctx.warnings()
+        );
+
+        // The generic profile keeps everything.
+        let mut ctx = ctx_with(None, "c.html");
+        let doc = dom::parse(html);
+        sanitize(&doc, &mut ctx).unwrap();
+        let out = dom::serialize_inner_xhtml(&dom::body(&doc).unwrap());
+        assert!(
+            out.contains("display:flex") && out.contains("100vh"),
+            "{out}"
+        );
+        assert!(ctx.warnings().is_empty());
+        assert!(has_viewport_unit("calc(100% - 2vh)"));
+        assert!(!has_viewport_unit("h1vh2 var(--x2vw) 12px"));
+    }
+
+    #[test]
+    fn html_lang_sets_book_language_and_wraps_other_languages() {
+        // First input with <html lang="de"> and no configured language.
+        let mut ctx = ctx_with(None, "a.html");
+        let chapters = convert(
+            r#"<!DOCTYPE html><html lang="de_DE"><head><title>Seite</title></head><body><p>Hallo</p></body></html>"#,
+            &mut ctx,
+            "a.html",
+        );
+        assert_eq!(ctx.opts.meta.lang, "de-DE");
+        assert!(
+            !chapters[0].body_xhtml.contains("lang="),
+            "{}",
+            chapters[0].body_xhtml
+        );
+        // A later input in another language keeps it on a wrapper.
+        let chapters = convert(
+            r#"<html lang="fr"><body><p>Bonjour</p></body></html>"#,
+            &mut ctx,
+            "b.html",
+        );
+        assert_eq!(ctx.opts.meta.lang, "de-DE");
+        assert!(
+            chapters[0]
+                .body_xhtml
+                .starts_with(r#"<div lang="fr" xml:lang="fr"><p>Bonjour</p>"#),
+            "{}",
+            chapters[0].body_xhtml
+        );
+        // An explicit language wins.
+        let mut ctx = ctx_with(None, "a.html");
+        ctx.opts.lang_given = true;
+        convert(
+            r#"<html lang="de"><body><p>x</p></body></html>"#,
+            &mut ctx,
+            "a.html",
+        );
+        assert_eq!(ctx.opts.meta.lang, "en");
+        // Invalid tags are ignored with a warning.
+        let mut ctx = ctx_with(None, "a.html");
+        convert(
+            r#"<html lang="12"><body><p>x</p></body></html>"#,
+            &mut ctx,
+            "a.html",
+        );
+        assert_eq!(ctx.opts.meta.lang, "en");
+        assert_eq!(ctx.warnings().len(), 1, "{:?}", ctx.warnings());
+    }
+
+    #[test]
+    fn xhtml_input_is_read_like_xml() {
+        let x = r#"<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head>
+<style><![CDATA[ h1 { color: blue } p > b { x: "<&>" } ]]></style></head>
+<body><p><![CDATA[cdata text & <tags>]]></p><div/><p>after</p><br/><span epub:type="z">s</span></body></html>"#;
+        assert!(is_xhtml_input(Path::new("a.html"), x));
+        assert!(is_xhtml_input(Path::new("a.XHTML"), "<p>"));
+        assert!(!is_xhtml_input(Path::new("a.html"), "<p>"));
+        let html = xhtml_to_html(x);
+        let mut ctx = ctx_with(None, "x.xhtml");
+        let chapters = convert(&html, &mut ctx, "x.xhtml");
+        let body = &chapters[0].body_xhtml;
+        assert!(
+            body.contains("<style> h1 { color: blue } p &gt; b { x: \"&lt;&amp;&gt;\" } </style>"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<p>cdata text &amp; &lt;tags&gt;</p>"),
+            "{body}"
+        );
+        assert!(body.contains("<div></div><p>after</p><br/>"), "{body}");
+        assert!(body.contains(r#"epub:type="z""#), "{body}");
+        // Garbage does not panic.
+        for junk in ["<![CDATA[", "<div/", "<style>a", "<a b='/>", "<"] {
+            let _ = xhtml_to_html(junk);
+        }
+    }
+
+    #[test]
+    fn unresolvable_parent_and_scheme_links_are_removed() {
+        let mut ctx = ctx_with(None, "d1/a.md");
+        let mut chapters = convert(
+            r#"<p><a href="../x.md">up</a> <a href="../images/ok.png">res</a>
+            <a href="../text/ch001.xhtml">ch</a> <a href="../nope/zz.md">nope</a>
+            <a href="file:///etc/hosts">file</a> <a href="data:text/plain,hi">data</a>
+            <a href="blob:https://x/1">blob</a> <a href="tel:+123">tel</a></p>"#,
+            &mut ctx,
+            "d1/a.md",
+        );
+        let warnings = fix_links_with_resources(&mut chapters, &["images/ok.png".to_string()]);
+        let body = &chapters[0].body_xhtml;
+        assert!(body.contains("<a>up</a>"), "{body}");
+        assert!(
+            body.contains(r#"<a href="../images/ok.png">res</a>"#),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<a href="../text/ch001.xhtml">ch</a>"#),
+            "{body}"
+        );
+        assert!(body.contains("<a>nope</a>"), "{body}");
+        assert!(body.contains("<a>file</a>"), "{body}");
+        assert!(body.contains("<a>data</a>"), "{body}");
+        assert!(body.contains("<a>blob</a>"), "{body}");
+        assert!(body.contains(r#"<a href="tel:+123">tel</a>"#), "{body}");
+        assert_eq!(warnings.len(), 5, "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("'data:'")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn file_urls_to_inputs_map_to_chapters() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.md");
+        let b = dir.path().join("b.md");
+        std::fs::write(&a, "x").unwrap();
+        std::fs::write(&b, "y").unwrap();
+        let a_str = a.to_string_lossy().into_owned();
+        let b_str = b.to_string_lossy().into_owned();
+        let mut ctx = ctx_with(None, &a_str);
+        let mut chapters = convert(
+            &format!(r#"<p><a href="file://{b_str}#sec">to b</a></p>"#),
+            &mut ctx,
+            &a_str,
+        );
+        chapters.extend(convert(r#"<h2 id="sec">S</h2>"#, &mut ctx, &b_str));
+        let warnings = fix_links_with_warnings(&mut chapters);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            chapters[0]
+                .body_xhtml
+                .contains(r#"<a href="ch002.xhtml#sec">to b</a>"#),
+            "{}",
+            chapters[0].body_xhtml
+        );
+    }
+
+    #[test]
+    fn picture_sources_and_srcset_are_kept_for_assets() {
+        let out = sanitized_body(
+            r#"<picture><source srcset="p.webp 1x, p2.webp 2x" type="image/webp"><source srcset="p.png"><img src="missing.png" srcset="i.png 2x" alt="a"></picture>"#,
+        );
+        assert!(
+            !out.contains("<source") && !out.contains("<picture"),
+            "{out}"
+        );
+        assert!(out.contains(r#"data-md2epub-srcset="i.png 2x""#), "{out}");
+        assert!(
+            out.contains("data-md2epub-sources=\"p.webp 1x, p2.webp 2x&#10;p.png\""),
+            "{out}"
+        );
     }
 }

@@ -17,10 +17,18 @@
 //!
 //! The output PNG is 8-bit RGB (no alpha channel), which is what the strict
 //! device profiles need.
+//!
+//! Rendering runs on a worker thread with a time budget
+//! ([`RASTER_TIMEOUT`]), and `feTurbulence` octaves are clamped, so a
+//! pathological document fails with an error instead of hanging the run.
+//! [`replace_foreign_objects`] lets callers swap HTML-in-SVG (which no
+//! rasterizer here can draw) for plain text first.
 
+use std::borrow::Cow;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, mpsc};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use usvg::fontdb;
@@ -50,6 +58,13 @@ const MAX_PIXELS: f32 = 32_000_000.0;
 /// Scale used when the caller passes a non-finite or non-positive one.
 const DEFAULT_SCALE: f32 = 2.0;
 
+/// Longest a single rasterization may take before it is abandoned.
+pub const RASTER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// More `feTurbulence` octaves than this add nothing visible, but cost
+/// time linearly.
+const MAX_TURBULENCE_OCTAVES: u32 = 10;
+
 /// A rendered PNG.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Raster {
@@ -69,8 +84,55 @@ pub fn rasterize(
     max_h: u32,
     scale: f32,
 ) -> Result<Raster> {
+    rasterize_within(svg, resources_dir, max_w, max_h, scale, RASTER_TIMEOUT)
+}
+
+/// [`rasterize`] with an explicit time budget. On timeout the worker thread
+/// is left to finish on its own and an error is returned.
+fn rasterize_within(
+    svg: &[u8],
+    resources_dir: Option<&Path>,
+    max_w: u32,
+    max_h: u32,
+    scale: f32,
+    timeout: Duration,
+) -> Result<Raster> {
+    let svg = svg.to_vec();
+    let dir: Option<PathBuf> = resources_dir.map(Path::to_path_buf);
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("md2epub-svg".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                rasterize_now(&svg, dir.as_deref(), max_w, max_h, scale)
+            }))
+            .unwrap_or_else(|_| Err(anyhow!("SVG renderer failed on this document")));
+            let _ = tx.send(result);
+        })
+        .context("starting the SVG renderer")?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => bail!(
+            "rendering the SVG took longer than {} s and was abandoned",
+            timeout.as_secs_f32()
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("SVG renderer failed on this document")
+        }
+    }
+}
+
+fn rasterize_now(
+    svg: &[u8],
+    resources_dir: Option<&Path>,
+    max_w: u32,
+    max_h: u32,
+    scale: f32,
+) -> Result<Raster> {
     let opts = options(resources_dir, Some(font_db()));
-    let tree = parse(svg, &opts)?;
+    let svg = clamp_turbulence(svg);
+    let tree = parse(&svg, &opts)?;
 
     let size = tree.size();
     let (nw, nh) = (size.width(), size.height());
@@ -118,6 +180,178 @@ pub fn rasterize(
         width: pw,
         height: ph,
     })
+}
+
+/// Lowers `numOctaves` of `feTurbulence` filters to
+/// [`MAX_TURBULENCE_OCTAVES`] (rendering time grows with it).
+fn clamp_turbulence(svg: &[u8]) -> Cow<'_, [u8]> {
+    const ATTR: &[u8] = b"numOctaves";
+    if !svg.windows(ATTR.len()).any(|w| w == ATTR) {
+        return Cow::Borrowed(svg);
+    }
+    let Ok(text) = std::str::from_utf8(svg) else {
+        return Cow::Borrowed(svg);
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("numOctaves") {
+        let (head, tail) = rest.split_at(i + "numOctaves".len());
+        out.push_str(head);
+        let after_eq = tail.trim_start();
+        let Some(after_eq) = after_eq.strip_prefix('=') else {
+            rest = tail;
+            continue;
+        };
+        let value_part = after_eq.trim_start();
+        let Some(q) = value_part
+            .chars()
+            .next()
+            .filter(|c| *c == '"' || *c == '\'')
+        else {
+            rest = tail;
+            continue;
+        };
+        let Some(end) = value_part[1..].find(q) else {
+            rest = tail;
+            continue;
+        };
+        let value = &value_part[1..1 + end];
+        let clamped = match value.trim().parse::<f64>() {
+            Ok(n) if n > MAX_TURBULENCE_OCTAVES as f64 => MAX_TURBULENCE_OCTAVES.to_string(),
+            _ => value.to_string(),
+        };
+        out.push_str(&format!("={q}{clamped}{q}"));
+        rest = &value_part[1 + end + 1..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out.into_bytes())
+}
+
+/// Replaces every `<foreignObject>` element (HTML embedded in SVG, which
+/// cannot be rasterized) with plain text: inside a `<switch>` it is just
+/// removed so the switch's SVG fallback is drawn; elsewhere it becomes a
+/// `<text>` centred in its box. Returns `None` when there is none.
+pub fn replace_foreign_objects(svg: &str) -> Option<String> {
+    let lower = svg.to_ascii_lowercase();
+    if !lower.contains("<foreignobject") && !lower.contains(":foreignobject") {
+        return None;
+    }
+    let mut out = String::with_capacity(svg.len());
+    let mut pos = 0;
+    let mut found = false;
+    while let Some(start) = find_foreign_object(&lower, pos) {
+        let Some(tag_len) = lower[start..].find('>') else {
+            break;
+        };
+        let tag_end = start + tag_len + 1;
+        let self_closing = svg[..tag_end].ends_with("/>");
+        let end = if self_closing {
+            tag_end
+        } else {
+            match lower[tag_end..].find("foreignobject>") {
+                Some(i) => {
+                    // Back up to the `</` (with any prefix) before the name.
+                    tag_end + i + "foreignobject>".len()
+                }
+                None => svg.len(),
+            }
+        };
+        let close_start = svg[tag_end..end].rfind("</").map_or(end, |i| tag_end + i);
+        found = true;
+        out.push_str(&svg[pos..start]);
+        let before = &lower[..start];
+        let in_switch = before
+            .rfind("<switch")
+            .is_some_and(|s| before.rfind("</switch").is_none_or(|e| e < s));
+        if !in_switch {
+            let text = plain_text(&svg[tag_end..close_start.max(tag_end)]);
+            if !text.is_empty() {
+                let tag = &svg[start..tag_end];
+                let num = |name: &str| attr_number(tag, name).unwrap_or(0.0);
+                let (x, y, w, h) = (num("x"), num("y"), num("width"), num("height"));
+                out.push_str(&format!(
+                    "<text x=\"{}\" y=\"{}\" text-anchor=\"middle\" dominant-baseline=\"central\" font-size=\"14\" font-family=\"sans-serif\">{text}</text>",
+                    x + w / 2.0,
+                    y + h / 2.0
+                ));
+            }
+        }
+        pos = end;
+    }
+    if !found {
+        return None;
+    }
+    out.push_str(&svg[pos..]);
+    Some(out)
+}
+
+/// Start of the next `<foreignObject` or `<prefix:foreignObject` tag in the
+/// lowercased text.
+fn find_foreign_object(lower: &str, from: usize) -> Option<usize> {
+    let mut i = from;
+    while let Some(off) = lower[i..].find("foreignobject") {
+        let at = i + off;
+        let head = &lower[..at];
+        let lt = head.rfind('<')?;
+        let name = &head[lt + 1..];
+        if !name.starts_with('/')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '-' || c == '_')
+            && (name.is_empty() || name.ends_with(':'))
+        {
+            let next = lower[at + "foreignobject".len()..].chars().next();
+            if next.is_some_and(|c| c.is_whitespace() || c == '>' || c == '/') {
+                return Some(lt);
+            }
+        }
+        i = at + 1;
+    }
+    None
+}
+
+/// Text content of XML markup: tags removed, whitespace collapsed. Entity
+/// references are kept as they are (the result goes back into XML).
+fn plain_text(markup: &str) -> String {
+    let mut text = String::with_capacity(markup.len());
+    let mut in_tag = false;
+    for c in markup.chars() {
+        match c {
+            '<' => {
+                in_tag = true;
+                text.push(' ');
+            }
+            '>' if in_tag => in_tag = false,
+            c if !in_tag => text.push(c),
+            _ => {}
+        }
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A numeric attribute of a start tag (`x="10"`, `width='5.5px'`).
+fn attr_number(tag: &str, name: &str) -> Option<f32> {
+    let mut rest = tag;
+    while let Some(i) = rest.find(name) {
+        let before = rest[..i].chars().last();
+        let after = rest[i + name.len()..].trim_start();
+        rest = &rest[i + name.len()..];
+        if !before.is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let Some(v) = after.strip_prefix('=') else {
+            continue;
+        };
+        let v = v.trim_start();
+        let q = v.chars().next()?;
+        if q != '"' && q != '\'' {
+            continue;
+        }
+        let end = v[1..].find(q)?;
+        let n = v[1..1 + end].trim().trim_end_matches("px");
+        return n.parse::<f32>().ok().filter(|n| n.is_finite());
+    }
+    None
 }
 
 /// Nominal `(width, height)` of an SVG in CSS pixels: `width`/`height` when
@@ -477,5 +711,53 @@ mod tests {
         assert_eq!(intrinsic_size(&svg).unwrap(), (300.0, 120.0));
         let (svg, _) = fixture("embedded-image.svg");
         assert_eq!(intrinsic_size(&svg).unwrap(), (64.0, 48.0));
+    }
+
+    #[test]
+    fn foreign_objects_become_text() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="40"><foreignObject x="0" y="0" width="200" height="40"><div xmlns="http://www.w3.org/1999/xhtml">hi <b>there</b></div></foreignObject></svg>"#;
+        let out = replace_foreign_objects(svg).unwrap();
+        assert!(!out.contains("foreignObject"), "{out}");
+        assert!(out.contains(r#"<text x="100" y="20""#), "{out}");
+        assert!(out.contains(">hi there</text>"), "{out}");
+        let r = rasterize(out.as_bytes(), None, 1000, 1000, 2.0).unwrap();
+        assert!(non_white(&decode(&r)) > 0, "text was drawn");
+
+        // Inside <switch> the SVG fallback is used instead.
+        let sw = r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><switch><foreignObject width="10" height="10"><p>x</p></foreignObject><text y="8">fb</text></switch></svg>"#;
+        let out = replace_foreign_objects(sw).unwrap();
+        assert!(
+            !out.contains("foreignObject") && out.contains(">fb</text>"),
+            "{out}"
+        );
+        assert!(!out.contains("<p>"), "{out}");
+
+        assert!(replace_foreign_objects("<svg/>").is_none());
+        let _ = replace_foreign_objects("<svg><foreignObject");
+        let _ = replace_foreign_objects("<svg><foreignObject x='1'>never closed");
+        let _ = replace_foreign_objects("<svg><x:foreignObject/><foreignObjectX/></svg>");
+    }
+
+    #[test]
+    fn turbulence_octaves_are_clamped() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200"><filter id="f"><feTurbulence baseFrequency="0.05" numOctaves = "100000"/></filter><rect width="200" height="200" filter="url(#f)"/></svg>"#;
+        let clamped = clamp_turbulence(svg);
+        let text = std::str::from_utf8(&clamped).unwrap();
+        assert!(text.contains(r#"numOctaves="10""#), "{text}");
+        let start = std::time::Instant::now();
+        rasterize(svg, None, 400, 400, 1.0).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+        assert!(matches!(clamp_turbulence(b"<svg/>"), Cow::Borrowed(_)));
+        let small = clamp_turbulence(br#"<x numOctaves='3'/>"#);
+        assert_eq!(&*small, br#"<x numOctaves='3'/>"#);
+    }
+
+    #[test]
+    fn rasterizing_has_a_time_budget() {
+        let (svg, dir) = fixture("diagram.svg");
+        let err = rasterize_within(&svg, Some(&dir), 4000, 4000, 4.0, Duration::from_nanos(1));
+        if let Err(e) = err {
+            assert!(e.to_string().contains("abandoned"), "{e}");
+        }
     }
 }

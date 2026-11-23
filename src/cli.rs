@@ -22,7 +22,8 @@ use crate::model::{Margin, MathMode, NotesPlacement, NotesStyle, SvgMode};
     name = "md2epub",
     version,
     about,
-    args_conflicts_with_subcommands = false
+    args_conflicts_with_subcommands = false,
+    subcommand_precedence_over_arg = true
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -105,20 +106,32 @@ pub struct Flags {
     pub svg: Option<SvgMode>,
 
     /// Convert images to grayscale.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, overrides_with = "no_grayscale")]
     pub grayscale: bool,
+
+    /// Keep colors (overrides `grayscale = true` in book.toml).
+    #[arg(long = "no-grayscale", global = true, overrides_with = "grayscale")]
+    pub no_grayscale: bool,
 
     /// Extra CSS file appended to the built-in stylesheet.
     #[arg(long, global = true, value_name = "FILE")]
     pub css: Option<PathBuf>,
 
     /// Do not fetch remote images.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, overrides_with = "no_offline")]
     pub offline: bool,
 
+    /// Fetch remote images (overrides `offline = true` in book.toml).
+    #[arg(long = "no-offline", global = true, overrides_with = "offline")]
+    pub no_offline: bool,
+
     /// Verbose output.
-    #[arg(short = 'v', long, global = true)]
+    #[arg(short = 'v', long, global = true, overrides_with = "no_verbose")]
     pub verbose: bool,
+
+    /// Quiet output (overrides `verbose = true` in book.toml).
+    #[arg(long = "no-verbose", global = true, overrides_with = "verbose")]
+    pub no_verbose: bool,
 }
 
 #[cfg(test)]
@@ -187,6 +200,32 @@ mod tests {
         assert_eq!(cli.flags.line_spacing, Some(1.4));
         assert_eq!(cli.flags.svg, Some(SvgMode::Rasterize));
         assert_eq!(cli.flags.split_level.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn negative_boolean_flags() {
+        let cli =
+            Cli::try_parse_from(["md2epub", "a.md", "--no-offline", "--no-grayscale"]).unwrap();
+        assert!(cli.flags.no_offline && !cli.flags.offline);
+        assert!(cli.flags.no_grayscale && !cli.flags.grayscale);
+        // The last of a flag and its negation wins.
+        let cli =
+            Cli::try_parse_from(["md2epub", "a.md", "--no-offline", "--offline", "-v"]).unwrap();
+        assert!(cli.flags.offline && !cli.flags.no_offline && cli.flags.verbose);
+        let cli = Cli::try_parse_from(["md2epub", "a.md", "-v", "--no-verbose"]).unwrap();
+        assert!(!cli.flags.verbose && cli.flags.no_verbose);
+    }
+
+    #[test]
+    fn build_after_positional_inputs_is_the_subcommand() {
+        let cli = Cli::try_parse_from(["md2epub", "a.md", "build", "v.toml"]).unwrap();
+        assert_eq!(cli.inputs, vec![PathBuf::from("a.md")]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Build {
+                config: "v.toml".into()
+            })
+        );
     }
 
     #[test]

@@ -1056,3 +1056,240 @@ fn version_and_help() {
         assert!(help.contains(flag), "--help lacks {flag}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for review findings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn user_css_resources_are_embedded() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join("images")).unwrap();
+    std::fs::copy(
+        fixtures().join("images/chart.png"),
+        dir.path().join("images/chart.png"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixtures().join("images/diagram.svg"),
+        dir.path().join("images/diagram.svg"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("font.woff2"), b"wOF2fakefontdata").unwrap();
+    let css = dir.path().join("user.css");
+    std::fs::write(
+        &css,
+        "@font-face { font-family: U; src: url(font.woff2) format(\"woff2\"); }\n\
+         .a { background: url(images/chart.png); }\n\
+         .b { list-style-image: url(\"images/diagram.svg\"); }\n\
+         .c { background: url(missing.png); }\n",
+    )
+    .unwrap();
+    for profile in ["generic", "scribe"] {
+        let run = convert(&[
+            &fixture("kitchen-sink.md"),
+            "--profile",
+            profile,
+            "--css",
+            css.to_str().unwrap(),
+        ]);
+        // assert_links_resolve also checks every url() in base.css.
+        assert_valid(&run.epub);
+        let base = run.epub.css();
+        assert!(base.contains("url(\"../fonts/"), "{base}");
+        assert!(base.contains("url(\"../images/"), "{base}");
+        assert!(!base.contains("missing.png"), "{base}");
+        assert!(run.stderr.contains("missing.png"), "{}", run.stderr);
+        if profile == "scribe" {
+            assert_device_safe(&run.epub, "user css/scribe");
+        }
+    }
+}
+
+#[test]
+fn raw_mathml_is_removed_under_device_profiles() {
+    let dir = TempDir::new().unwrap();
+    let md = dir.path().join("m.md");
+    std::fs::write(
+        &md,
+        "# M\n\nInline <math><mi>x</mi></math> and\n\n<math display=\"block\"><semantics><mrow><mi>z</mi></mrow><annotation encoding=\"application/x-tex\">z^2</annotation></semantics></math>\n",
+    )
+    .unwrap();
+    for profile in STRICT_PROFILES {
+        let run = convert(&[md.to_str().unwrap(), "--profile", profile]);
+        assert_valid(&run.epub);
+        assert_device_safe(&run.epub, profile);
+        assert!(run.stderr.contains("TeX annotation"), "{}", run.stderr);
+    }
+    // The generic profile keeps MathML.
+    let run = convert(&[md.to_str().unwrap()]);
+    let doc = &run.epub.chapter_docs()[0];
+    assert!(run.epub.text(doc).contains("<math"));
+}
+
+#[test]
+fn output_path_cannot_overwrite_the_input() {
+    let dir = TempDir::new().unwrap();
+    let md = dir.path().join("a2.md");
+    std::fs::write(&md, "# Keep me\n").unwrap();
+    let md_s = md.to_str().unwrap();
+    assert_fails(&[md_s, "-o", md_s], "same as the input");
+    assert_eq!(std::fs::read_to_string(&md).unwrap(), "# Keep me\n");
+}
+
+#[test]
+fn explicit_missing_cover_fails() {
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("x.epub");
+    assert_fails(
+        &[
+            &fixture("kitchen-sink.md"),
+            "--cover",
+            "nope-cover.png",
+            "--offline",
+            "-o",
+            out.to_str().unwrap(),
+        ],
+        "cover image not found",
+    );
+}
+
+#[test]
+fn verbose_from_book_toml_prints_each_warning_once() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a.md"), "# A\n\n![m](missing.png)\n").unwrap();
+    let toml = dir.path().join("v.toml");
+    std::fs::write(
+        &toml,
+        "inputs = [\"a.md\"]\nverbose = true\noffline = true\noutput = \"v.epub\"\n",
+    )
+    .unwrap();
+    let out = run_raw(&["build", toml.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(
+        stderr.matches("warning: image not embedded").count(),
+        1,
+        "{stderr}"
+    );
+    // The flag turns it off again.
+    let out = run_raw(&["build", toml.to_str().unwrap(), "--no-verbose"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("processing"), "{stderr}");
+    assert_eq!(
+        stderr.matches("warning: image not embedded").count(),
+        1,
+        "{stderr}"
+    );
+}
+
+#[test]
+fn footnotes_have_epub_semantics() {
+    let run = convert(&[&fixture("kitchen-sink.md"), "--split-level", "none"]);
+    assert_valid(&run.epub);
+    let text = run.epub.text(&run.epub.chapter_docs()[0]);
+    assert!(
+        text.contains("epub:type=\"noteref\" role=\"doc-noteref\""),
+        "no noteref"
+    );
+    assert!(
+        text.contains("epub:type=\"endnotes\" role=\"doc-endnotes\""),
+        "no endnotes"
+    );
+    assert!(text.contains("epub:type=\"endnote\""), "no endnote");
+    assert!(text.contains("role=\"doc-backlink\""), "no backlink");
+}
+
+#[test]
+fn margin_presets_leave_note_pages_full_width() {
+    let run = convert(&[
+        &fixture("kitchen-sink.md"),
+        "--profile",
+        "scribe",
+        "--margin",
+        "extra",
+        "--notes",
+        "after-chapter",
+    ]);
+    assert_valid(&run.epub);
+    let notes: Vec<String> = run
+        .epub
+        .chapter_docs()
+        .into_iter()
+        .filter(|d| run.epub.is_note_page(d))
+        .collect();
+    assert!(!notes.is_empty());
+    for d in &notes {
+        assert!(run.epub.text(d).contains("<body class=\"notes\">"), "{d}");
+    }
+    let css = run.epub.css();
+    let preset = css.find("margin preset: extra").unwrap();
+    let reset = css.find("body.notes").expect("no body.notes rule");
+    assert!(reset > preset);
+}
+
+#[test]
+fn html_lang_and_language_tags() {
+    let dir = TempDir::new().unwrap();
+    let html = dir.path().join("p.html");
+    std::fs::write(
+        &html,
+        "<!DOCTYPE html><html lang=\"de\"><head><title>Seite</title></head><body><p>Hallo</p></body></html>",
+    )
+    .unwrap();
+    let run = convert(&[html.to_str().unwrap()]);
+    let opf = run.epub.text("OEBPS/content.opf");
+    assert!(opf.contains("<dc:language>de</dc:language>"), "{opf}");
+
+    let md = dir.path().join("l.md");
+    std::fs::write(&md, "---\nlang: \"en_US\"\ndate: 2024-13-45\n---\n# L\n").unwrap();
+    let run = convert(&[md.to_str().unwrap()]);
+    let opf = run.epub.text("OEBPS/content.opf");
+    assert!(opf.contains("<dc:language>en-US</dc:language>"), "{opf}");
+    assert!(run.stderr.contains("2024-13-45"), "{}", run.stderr);
+
+    let run = convert(&[md.to_str().unwrap(), "--lang", "xx-invalid-tag-!!"]);
+    let opf = run.epub.text("OEBPS/content.opf");
+    assert!(opf.contains("<dc:language>en</dc:language>"), "{opf}");
+    assert!(
+        run.stderr.contains("invalid language tag"),
+        "{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn deeply_nested_input_fails_cleanly() {
+    let dir = TempDir::new().unwrap();
+    let html = dir.path().join("deep.html");
+    std::fs::write(&html, "<div>".repeat(20_000)).unwrap();
+    let out = dir.path().join("d.epub");
+    assert_fails(
+        &[html.to_str().unwrap(), "-o", out.to_str().unwrap()],
+        "nested",
+    );
+}
+
+#[test]
+fn build_after_an_input_is_the_subcommand() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a.md"), "# A\n").unwrap();
+    std::fs::write(dir.path().join("b.md"), "# B\n").unwrap();
+    let toml = dir.path().join("v.toml");
+    std::fs::write(&toml, "inputs = [\"a.md\"]\noffline = true\n").unwrap();
+    let out = dir.path().join("o.epub");
+    let res = run_raw(&[
+        dir.path().join("b.md").to_str().unwrap(),
+        "build",
+        toml.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(res.status.success(), "{stderr}");
+    let epub = Epub::open(&out);
+    assert!(
+        epub.text("OEBPS/content.opf")
+            .contains("<dc:title>B</dc:title>")
+    );
+}

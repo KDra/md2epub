@@ -11,8 +11,17 @@
 //!   `<img data-res="1" class="math-inline|math-display" alt="LATEX">` sized in
 //!   `em` with `vertical-align` from the depth; `mathml` → inline `<math>`;
 //!   `off` → the LaTeX in `<code>`. On a render failure keep the source in
-//!   `<code class="math-error">` and warn. Under the `scribe` profile,
-//!   `mathml` mode warns that Send to Kindle may reject the file.
+//!   `<code class="math-error">` and warn. (`config::finalize` warns when
+//!   `mathml` is chosen for a device profile.)
+//! - Under the device profiles (`profile.flatten_alpha`) no `<math>` may
+//!   remain unless `mathml` was chosen: raw MathML from the input is
+//!   rendered from its TeX annotation (or `alttext`) like a placeholder, or
+//!   replaced by its text in `<code class="math-error">` with a warning.
+//! - Rendering runs on a worker thread with a time budget
+//!   ([`RENDER_TIMEOUT`]); self-referential `\newcommand`/`\def`
+//!   definitions are refused up front, since they never terminate.
+//! - Math images are rasterized at [`MATH_RASTER_SCALE`] (about 160 px per
+//!   em), so formulas stay sharp when the reader enlarges the text.
 //!
 //! Rendering route (see the T6 spike notes in the final report):
 //! LaTeX is translated to Typst math with `mitex`, evaluated against the
@@ -21,12 +30,23 @@
 //! exported with `typst-svg` (glyphs become paths, so the SVG needs no
 //! fonts). MathML comes from `pulldown-latex`.
 
-use anyhow::{Result, anyhow, bail};
+use std::sync::mpsc;
+use std::time::Duration;
+
+use anyhow::{Context as _, Result, anyhow, bail};
 use pulldown_latex::{Parser, RenderConfig, Storage, config::DisplayMode, push_mathml};
 
 use crate::ctx::Ctx;
 use crate::dom::{self, Handle};
 use crate::model::MathMode;
+
+/// Longest one formula may take to render before it is given up.
+pub const RENDER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Raster scale for math images. The SVG's nominal size is 20 pt (about
+/// 26.7 px) per em, so this gives about 160 px per em: crisp at 300 ppi
+/// even when the reader enlarges the text.
+pub const MATH_RASTER_SCALE: f32 = 6.0;
 
 /// Longest LaTeX source accepted by the renderers (guards against runaway input).
 const MAX_LATEX_LEN: usize = 20_000;
@@ -55,7 +75,114 @@ pub struct MathSvg {
 /// renderer does not know and in builds without the `math` feature.
 pub fn render_svg(latex: &str, display: bool) -> Result<MathSvg> {
     let latex = check_source(latex)?;
-    render::render(latex, display)
+    check_macros(latex)?;
+    render_within(latex, display, RENDER_TIMEOUT)
+}
+
+/// Renders on a worker thread and gives up after `timeout` (the thread is
+/// then left to finish on its own).
+fn render_within(latex: &str, display: bool, timeout: Duration) -> Result<MathSvg> {
+    let latex = latex.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("md2epub-math".into())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let result = std::panic::catch_unwind(|| render::render(&latex, display))
+                .unwrap_or_else(|_| Err(anyhow!("the math renderer failed on this input")));
+            let _ = tx.send(result);
+        })
+        .context("starting the math renderer")?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => bail!(
+            "rendering took longer than {} s and was abandoned",
+            timeout.as_secs()
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("the math renderer failed on this input")
+        }
+    }
+}
+
+/// Refuses macro definitions whose body uses the macro itself
+/// (`\newcommand{\z}[1]{\z{#1}}`, `\def\a{\a}`): expanding them never ends.
+fn check_macros(latex: &str) -> Result<()> {
+    const DEFINERS: &[&str] = &[
+        "newcommand",
+        "renewcommand",
+        "providecommand",
+        "DeclareMathOperator",
+        "def",
+        "gdef",
+        "edef",
+        "xdef",
+    ];
+    let b = latex.as_bytes();
+    let mut i = 0;
+    while let Some(off) = latex[i..].find('\\') {
+        let at = i + off + 1;
+        let word_end = at
+            + latex[at..]
+                .find(|c: char| !c.is_ascii_alphabetic())
+                .unwrap_or(latex.len() - at);
+        let word = &latex[at..word_end];
+        i = word_end.max(at);
+        if !DEFINERS.contains(&word) {
+            continue;
+        }
+        // The macro name: `{\name}` or `\name`, after an optional `*`.
+        let mut k = word_end;
+        while k < b.len() && (b[k].is_ascii_whitespace() || b[k] == b'*') {
+            k += 1;
+        }
+        if b.get(k) == Some(&b'{') {
+            k += 1;
+            while k < b.len() && b[k].is_ascii_whitespace() {
+                k += 1;
+            }
+        }
+        if b.get(k) != Some(&b'\\') {
+            continue;
+        }
+        let name_start = k + 1;
+        let name_end = name_start
+            + latex[name_start..]
+                .find(|c: char| !c.is_ascii_alphabetic())
+                .unwrap_or(latex.len() - name_start);
+        let name = &latex[name_start..name_end];
+        if name.is_empty() {
+            continue;
+        }
+        // The body: the first balanced group after the name.
+        let Some(open) = latex[name_end..].find('{').map(|o| name_end + o) else {
+            continue;
+        };
+        let mut depth = 0usize;
+        let mut close = latex.len();
+        for (j, c) in latex[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = open + j;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &latex[open..close];
+        let needle = format!("\\{name}");
+        let recursive = body
+            .match_indices(&needle)
+            .any(|(p, _)| !body[p + needle.len()..].starts_with(|c: char| c.is_ascii_alphabetic()));
+        if recursive {
+            bail!("the macro \\{name} is defined in terms of itself");
+        }
+    }
+    Ok(())
 }
 
 /// Converts LaTeX math to a MathML `<math>` element. See the module docs.
@@ -69,13 +196,15 @@ pub fn render_mathml(latex: &str, display: bool) -> Result<String> {
     if let Some(err) = events.iter().find_map(|e| e.as_ref().err()) {
         bail!("{}", first_line(&err.to_string()));
     }
+    let escaped = dom::escape(latex);
     let config = RenderConfig {
         display_mode: if display {
             DisplayMode::Block
         } else {
             DisplayMode::Inline
         },
-        annotation: Some(latex),
+        // The annotation is copied into the output as is: escape it.
+        annotation: Some(&escaped),
         ..RenderConfig::default()
     };
     let mut out = String::new();
@@ -95,7 +224,17 @@ pub fn transform(doc: &Handle, ctx: &mut Ctx) -> Result<()> {
         .into_iter()
         .filter(|s| dom::has_attr(s, "data-math-style"))
         .collect();
-    if spans.is_empty() {
+    // Raw MathML must go on device profiles unless MathML was asked for.
+    let convert_raw = ctx.opts.profile.flatten_alpha && ctx.opts.math != MathMode::Mathml;
+    let raw: Vec<Handle> = if convert_raw {
+        dom::select_by_tag(doc, "math")
+            .into_iter()
+            .filter(|m| is_mathml(m) && !has_math_ancestor(m))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if spans.is_empty() && raw.is_empty() {
         return Ok(());
     }
 
@@ -107,11 +246,8 @@ pub fn transform(doc: &Handle, ctx: &mut Ctx) -> Result<()> {
         );
         mode = MathMode::Off;
     }
-    if mode == MathMode::Mathml && ctx.opts.profile.name.eq_ignore_ascii_case("scribe") {
-        ctx.warn(
-            "math: MathML output under the scribe profile; Send to Kindle may reject \
-             the file (use --math image)",
-        );
+    for m in raw {
+        replace_raw_math(&m, mode, ctx);
     }
 
     for span in spans {
@@ -144,6 +280,83 @@ pub fn transform(doc: &Handle, ctx: &mut Ctx) -> Result<()> {
     Ok(())
 }
 
+fn is_mathml(node: &Handle) -> bool {
+    dom::namespace(node).is_some_and(|ns| ns == dom::MATHML_NS)
+}
+
+fn has_math_ancestor(node: &Handle) -> bool {
+    let mut cur = dom::parent(node);
+    while let Some(p) = cur {
+        if dom::is_tag(&p, "math") && is_mathml(&p) {
+            return true;
+        }
+        cur = dom::parent(&p);
+    }
+    false
+}
+
+/// The TeX source of a raw `<math>` element: its
+/// `<annotation encoding="application/x-tex">`, else its `alttext`.
+fn raw_math_source(math: &Handle) -> Option<String> {
+    let annotation = dom::select_by_tag(math, "annotation")
+        .into_iter()
+        .find(|a| {
+            dom::get_attr(a, "encoding").is_some_and(|e| {
+                let e = e.trim().to_ascii_lowercase();
+                e == "application/x-tex" || e == "text/x-tex" || e == "application/x-latex"
+            })
+        });
+    annotation
+        .map(|a| dom::text_content(&a))
+        .or_else(|| dom::get_attr(math, "alttext"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Replaces a raw `<math>` element (from the input) by an image, the TeX
+/// source in `<code>`, or its text in `<code class="math-error">`.
+fn replace_raw_math(math: &Handle, mode: MathMode, ctx: &mut Ctx) {
+    let display = dom::get_attr(math, "display")
+        .or_else(|| dom::get_attr(math, "mode"))
+        .is_some_and(|d| {
+            let d = d.trim().to_ascii_lowercase();
+            d == "block" || d == "display"
+        });
+    let class = if display {
+        "math-display"
+    } else {
+        "math-inline"
+    };
+    let source = raw_math_source(math);
+    let replacement = match (&source, mode) {
+        (Some(tex), MathMode::Image) => match image_node(tex, display, class, ctx) {
+            Ok(img) => img,
+            Err(err) => {
+                ctx.warn(format!(
+                    "math: could not render MathML `{}`: {err:#}",
+                    shorten(tex)
+                ));
+                code_node(&format!("math-error {class}"), tex)
+            }
+        },
+        (Some(tex), _) => code_node(class, tex),
+        (None, _) => {
+            let text = dom::text_content(math)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            ctx.warn(format!(
+                "math: MathML without a TeX annotation cannot be shown under the {} profile; \
+                 kept as text: `{}`",
+                ctx.opts.profile.name,
+                shorten(&text)
+            ));
+            code_node(&format!("math-error {class}"), &text)
+        }
+    };
+    dom::replace_with(math, &replacement);
+}
+
 /// `<code class="...">LATEX</code>`.
 fn code_node(class: &str, latex: &str) -> Handle {
     let code = dom::create_element("code", &[("class", class)]);
@@ -154,7 +367,8 @@ fn code_node(class: &str, latex: &str) -> Handle {
 /// Renders to SVG, stores it through `ctx.add_vector` and builds the `<img>`.
 fn image_node(latex: &str, display: bool, class: &str, ctx: &mut Ctx) -> Result<Handle> {
     let math = render_svg(latex, display)?;
-    let img = ctx.add_vector(&math.svg)?;
+    let dir = ctx.base_dir.clone();
+    let img = ctx.add_vector_scaled(&math.svg, Some(&dir), MATH_RASTER_SCALE)?;
     let style = if display {
         // Width only, so `max-width: 100%` from the stylesheet can shrink a
         // wide equation without distorting it.
@@ -544,17 +758,113 @@ mod tests {
     }
 
     #[test]
-    fn mathml_mode_warns_under_scribe() {
+    fn mathml_mode_under_scribe_warns_once_in_config() {
+        // The device-profile warning comes from `config::finalize`, once per
+        // run, not from every document.
         let mut ctx = ctx_with(MathMode::Mathml);
         ctx.opts.profile = profile::by_name("scribe").unwrap();
-        run(SAMPLE, &mut ctx);
+        ctx.opts.svg = crate::model::SvgMode::Rasterize;
+        let out = run(SAMPLE, &mut ctx);
+        assert!(ctx.warnings().is_empty(), "{:?}", ctx.warnings());
+        assert_eq!(out.matches("<math").count(), 2, "{out}");
+        let mut opts = ctx.opts.clone();
+        let w = crate::config::finalize(&mut opts);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("Send to Kindle"));
+    }
+
+    #[test]
+    fn mathml_annotation_is_escaped() {
+        let tex = r"\text{</annotation></semantics></math><b>bold</b> & <script>x</script>}";
+        let m = render_mathml(tex, false).unwrap();
+        let mut ctx = ctx_with(MathMode::Mathml);
+        let out = run(
+            &format!(
+                r#"<p><span data-math-style="inline">{}</span></p>"#,
+                dom::escape(tex)
+            ),
+            &mut ctx,
+        );
+        assert!(
+            !out.contains("<script") && !out.contains("<b>"),
+            "{m}\n{out}"
+        );
+        assert_eq!(out.matches("<math").count(), 1, "{out}");
+        // `a<b` keeps both sides.
+        let mut ctx = ctx_with(MathMode::Mathml);
+        let out = run(
+            r#"<p><span data-math-style="inline">a&lt;b</span></p>"#,
+            &mut ctx,
+        );
+        assert!(out.contains("a&lt;b</annotation>"), "{out}");
+    }
+
+    #[test]
+    fn raw_mathml_is_converted_on_device_profiles() {
+        let html = r#"<p>a <math><mi>x</mi></math> b
+            <math display="block"><semantics><mrow><mi>z</mi></mrow><annotation encoding="application/x-tex">z^2</annotation></semantics></math>
+            <math alttext="\alpha"><mi>α</mi></math></p>"#;
+        // Off mode: TeX in code, text otherwise.
+        let mut ctx = ctx_with(MathMode::Off);
+        ctx.opts.profile = profile::by_name("scribe").unwrap();
+        let out = run(html, &mut ctx);
+        assert!(!out.contains("<math"), "{out}");
+        assert!(
+            out.contains(r#"<code class="math-display">z^2</code>"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"<code class="math-inline">\alpha</code>"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"<code class="math-error math-inline">x</code>"#),
+            "{out}"
+        );
         assert_eq!(ctx.warnings().len(), 1, "{:?}", ctx.warnings());
-        assert!(ctx.warnings()[0].contains("Send to Kindle"));
-        // No math, no warning.
+        // Generic profile and MathML mode keep raw MathML.
+        let mut ctx = ctx_with(MathMode::Image);
+        assert_eq!(run(html, &mut ctx).matches("<math").count(), 3);
         let mut ctx = ctx_with(MathMode::Mathml);
-        ctx.opts.profile = profile::by_name("scribe").unwrap();
-        run("<p>no math here</p>", &mut ctx);
-        assert!(ctx.warnings().is_empty());
+        ctx.opts.profile = profile::by_name("remarkable").unwrap();
+        assert_eq!(run(html, &mut ctx).matches("<math").count(), 3);
+    }
+
+    #[test]
+    fn recursive_macros_are_refused() {
+        for bad in [
+            r"\newcommand{\z}[1]{\z{#1}}\z{a}",
+            r"\renewcommand\z{x\z}",
+            r"\def\a#1{\a{#1}}\a1",
+            r"\newcommand*{ \q }{\q}",
+        ] {
+            let err = check_macros(bad).unwrap_err().to_string();
+            assert!(err.contains("defined in terms of itself"), "{bad}: {err}");
+            assert!(render_svg(bad, false).is_err());
+        }
+        for ok in [
+            r"\newcommand{\z}[1]{\zeta{#1}}\z{a}",
+            r"\def\a{b}",
+            r"\newcommand",
+            r"x \\ y",
+        ] {
+            assert!(check_macros(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn render_timeout_gives_up() {
+        let start = std::time::Instant::now();
+        // A zero budget can never be met; the call must return promptly.
+        let r = render_within("x", false, Duration::from_millis(0));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        if let Err(e) = r {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("abandoned") || msg.contains("not available"),
+                "{msg}"
+            );
+        }
     }
 
     #[test]
@@ -725,6 +1035,35 @@ mod tests {
             assert_eq!(out.matches("<img").count(), 2, "{out}");
             assert!(ctx.resources().iter().all(|r| r.media_type == "image/png"));
             assert!(!out.contains("<svg") && !out.contains("<math"), "{out}");
+        }
+
+        #[test]
+        fn raw_mathml_becomes_images_under_scribe() {
+            let mut ctx = ctx_with(MathMode::Image);
+            ctx.opts.profile = profile::by_name("scribe").unwrap();
+            ctx.opts.svg = SvgMode::Rasterize;
+            let out = run(
+                r#"<p><math display="block"><semantics><mi>z</mi><annotation encoding="application/x-tex">z^2</annotation></semantics></math></p>"#,
+                &mut ctx,
+            );
+            assert!(!out.contains("<math"), "{out}");
+            assert!(out.contains(r#"class="math-display""#), "{out}");
+            assert!(out.contains(r#"alt="z^2""#), "{out}");
+            assert!(ctx.warnings().is_empty(), "{:?}", ctx.warnings());
+        }
+
+        #[test]
+        fn math_rasters_have_about_160_px_per_em() {
+            let mut ctx = ctx_with(MathMode::Image);
+            ctx.opts.svg = SvgMode::Rasterize;
+            run(
+                r#"<p><span data-math-style="inline">E = mc^2</span></p>"#,
+                &mut ctx,
+            );
+            let m = render_svg("E = mc^2", false).unwrap();
+            let png = image::load_from_memory(&ctx.resources()[0].data).unwrap();
+            let px_per_em = png.width() as f32 / m.width_em;
+            assert!((140.0..200.0).contains(&px_per_em), "{px_per_em}");
         }
 
         #[test]

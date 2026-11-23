@@ -977,6 +977,12 @@ fn ncx_points(nodes: &[TocNode], indent: usize, order: &mut usize, out: &mut Str
 /// the start of each chapter) move into `<head>`, where XHTML allows them.
 fn chapter_document(title: &str, lang: &str, body: &str) -> String {
     let (styles, body) = extract_styles(body);
+    // Note pages get a body class so margin presets can leave them alone.
+    let body_open = if body.trim_start().starts_with("<div class=\"notes-page") {
+        "<body class=\"notes\">"
+    } else {
+        "<body>"
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="{lang}" xml:lang="{lang}">
@@ -984,7 +990,7 @@ fn chapter_document(title: &str, lang: &str, body: &str) -> String {
 <title>{title}</title>
 <link rel="stylesheet" type="text/css" href="../css/base.css"/>
 {styles}</head>
-<body>
+{body_open}
 {body}
 </body>
 </html>
@@ -1866,5 +1872,17 @@ mod tests {
         let (s, rest) = extract_styles("<p>no styles</p><style>unterminated");
         assert!(s.is_empty());
         assert_eq!(rest, "<p>no styles</p><style>unterminated");
+    }
+
+    #[test]
+    fn note_pages_get_a_body_class() {
+        let doc = chapter_document(
+            "Notes",
+            "en",
+            r#"<div class="notes-page notes-lined"><img src="../images/n.png" alt=""/></div>"#,
+        );
+        assert!(doc.contains("<body class=\"notes\">"), "{doc}");
+        let doc = chapter_document("T", "en", "<p>x</p>");
+        assert!(doc.contains("<body>\n"), "{doc}");
     }
 }

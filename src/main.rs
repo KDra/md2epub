@@ -8,7 +8,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match pipeline::run(&cli) {
         Ok(report) => {
-            if !cli.flags.verbose {
+            if !report.verbose {
                 for w in &report.warnings {
                     eprintln!("warning: {w}");
                 }

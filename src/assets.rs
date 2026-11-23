@@ -24,10 +24,21 @@
 //!   the SVG (`images/`), so no base64 image ends up inside a kept SVG.
 //! - Fonts referenced from CSS `url(...)` are stored under `fonts/`.
 //! - A `url(...)` that cannot be resolved is replaced by `none` (with a
-//!   warning), so the book never references a missing file.
-//! - `<picture>` is reduced to its `<img>`, and `srcset`/`sizes` are dropped.
+//!   warning), so the book never references a missing file; in an
+//!   `@font-face` `src` descriptor the whole declaration is removed instead.
+//!   `url(...)` inside comments and strings is left alone, and `@import`
+//!   rules are removed with a warning (add such styles with `--css`).
+//! - The `--css` stylesheet goes through the same `url(...)` resolution
+//!   ([`rewrite_user_css`]), relative to its own directory.
+//! - Kept SVGs get the same treatment for `url(...)` in their `<style>`
+//!   elements and `style` attributes; external `<use>` references are
+//!   removed with a warning.
+//! - `<picture>` is reduced to its `<img>`. When `src` is missing or cannot be
+//!   loaded, the `srcset` candidates (largest first) and those of the
+//!   picture's `<source>` elements (kept by `html::sanitize`) are tried.
 //! - EXIF orientation of JPEGs is applied (the image is re-encoded), and CMYK
-//!   or 16-bit images are converted to 8-bit RGB/gray.
+//!   (detected from the JPEG header) or 16-bit images are converted to 8-bit
+//!   RGB/gray. Images over [`MAX_DECODE_PIXELS`] are refused before decoding.
 
 use std::io::{Cursor, Read};
 use std::ops::Range;
@@ -52,6 +63,7 @@ use percent_encoding::percent_decode_str;
 
 use crate::ctx::{Ctx, ImgRef, SVG_RASTER_SCALE, content_hash, fit_within};
 use crate::dom::{self, Handle};
+use crate::html::{SOURCES_ATTR, SRCSET_ATTR};
 use crate::model::{Resource, SvgMode, media_type_for_ext};
 use crate::svg;
 
@@ -67,6 +79,11 @@ const MAX_SVGZ_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SVG_NESTING: u32 = 4;
 /// Quality used when a JPEG has to be re-encoded.
 const JPEG_QUALITY: u8 = 90;
+/// Largest image (in pixels) that is decoded. A few KB of PNG can claim
+/// gigapixels; checking the header first keeps memory bounded.
+pub const MAX_DECODE_PIXELS: u64 = 100_000_000;
+/// Largest single allocation the image decoders may make.
+const MAX_DECODE_ALLOC: u64 = 1024 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -217,35 +234,104 @@ struct Stored {
 }
 
 fn process_img(img: &Handle, base: &Base, ctx: &mut Ctx) {
-    dom::remove_attr(img, "srcset");
-    dom::remove_attr(img, "sizes");
+    let own_srcset = dom::get_attr(img, SRCSET_ATTR)
+        .or_else(|| dom::get_attr(img, "srcset"))
+        .unwrap_or_default();
+    let sources = dom::get_attr(img, SOURCES_ATTR).unwrap_or_default();
+    for a in ["srcset", "sizes", SRCSET_ATTR, SOURCES_ATTR] {
+        dom::remove_attr(img, a);
+    }
     if dom::has_attr(img, "data-res") {
         dom::remove_attr(img, "data-res");
         ensure_alt(img);
         return;
     }
     let alt = dom::get_attr(img, "alt").unwrap_or_default();
-    let src = ["src", "data-src", "data-original"]
+    let mut candidates: Vec<String> = ["src", "data-src", "data-original"]
         .iter()
         .filter_map(|a| dom::get_attr(img, a))
         .map(|s| s.trim().to_string())
-        .find(|s| !s.is_empty());
-    let Some(src) = src else {
+        .filter(|s| !s.is_empty())
+        .take(1)
+        .collect();
+    candidates.extend(srcset_candidates(&own_srcset));
+    for line in sources.lines() {
+        candidates.extend(srcset_candidates(line));
+    }
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|c| seen.insert(c.clone()));
+    if candidates.is_empty() {
         ctx.warn(format!("image without a source dropped (alt: {alt:?})"));
         fallback(img, &alt);
         return;
-    };
-    match load(&src, base, ctx).and_then(|l| store(l, ctx)) {
-        Ok(stored) => {
-            dom::set_attr(img, "src", &stored.src);
-            fix_dimensions(img, stored.width, stored.height, stored.vector, ctx);
-            ensure_alt(img);
-        }
-        Err(e) => {
-            ctx.warn(format!("image not embedded: {} ({e:#})", short(&src)));
-            fallback(img, &alt);
+    }
+    let mut first_error = None;
+    for src in &candidates {
+        match load(src, base, ctx).and_then(|l| store(l, ctx)) {
+            Ok(stored) => {
+                dom::set_attr(img, "src", &stored.src);
+                fix_dimensions(img, stored.width, stored.height, stored.vector, ctx);
+                ensure_alt(img);
+                return;
+            }
+            Err(e) => {
+                first_error.get_or_insert((src.clone(), e));
+            }
         }
     }
+    if let Some((src, e)) = first_error {
+        ctx.warn(format!("image not embedded: {} ({e:#})", short(&src)));
+    }
+    fallback(img, &alt);
+}
+
+/// The URLs of a `srcset` value, largest descriptor (`w` or `x`) first.
+fn srcset_candidates(srcset: &str) -> Vec<String> {
+    let mut found: Vec<(String, f32)> = Vec::new();
+    let b = srcset.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b',') {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        let start = i;
+        while i < b.len() && !b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut url = &srcset[start..i];
+        let mut descriptor = String::new();
+        if url.ends_with(',') {
+            url = url.trim_end_matches(',');
+        } else {
+            let mut paren = 0usize;
+            while i < b.len() {
+                match b[i] {
+                    b'(' => paren += 1,
+                    b')' => paren = paren.saturating_sub(1),
+                    b',' if paren == 0 => break,
+                    _ => {}
+                }
+                descriptor.push(b[i] as char);
+                i += 1;
+            }
+        }
+        let value = descriptor
+            .split_ascii_whitespace()
+            .find_map(|d| {
+                d.strip_suffix(['w', 'x'])
+                    .and_then(|n| n.parse::<f32>().ok())
+            })
+            .filter(|v| v.is_finite())
+            .unwrap_or(1.0);
+        if !url.is_empty() {
+            found.push((url.to_string(), value));
+        }
+    }
+    found.sort_by(|a, b| b.1.total_cmp(&a.1));
+    found.into_iter().map(|(u, _)| u).collect()
 }
 
 fn replace_inline_svg(svg_el: &Handle, base: &Base, ctx: &mut Ctx) {
@@ -607,6 +693,18 @@ fn process_raster(bytes: Vec<u8>, o: RasterOpts) -> Result<RasterOut> {
         let mut decoder = reader
             .into_decoder()
             .with_context(|| format!("decoding {format:?} image"))?;
+        let (dw, dh) = decoder.dimensions();
+        if u64::from(dw) * u64::from(dh) > MAX_DECODE_PIXELS {
+            bail!(
+                "image is too large to embed ({dw}×{dh} pixels; the limit is {} megapixels)",
+                MAX_DECODE_PIXELS / 1_000_000
+            );
+        }
+        let mut limits = image::Limits::default();
+        limits.max_alloc = Some(MAX_DECODE_ALLOC);
+        decoder
+            .set_limits(limits)
+            .with_context(|| format!("decoding {format:?} image"))?;
         let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
         let color = decoder.color_type();
         let original = decoder.original_color_type();
@@ -635,7 +733,7 @@ fn process_raster(bytes: Vec<u8>, o: RasterOpts) -> Result<RasterOut> {
     let cmyk = matches!(
         original,
         ExtendedColorType::Cmyk8 | ExtendedColorType::Cmyk16
-    );
+    ) || (format == ImageFormat::Jpeg && jpeg_is_cmyk(&bytes));
     let resize = (tw, th) != (w, h);
     let flatten = o.flatten && has_alpha;
     let to_gray = o.grayscale && !is_gray;
@@ -684,6 +782,45 @@ fn process_raster(bytes: Vec<u8>, o: RasterOpts) -> Result<RasterOut> {
         width: img.width(),
         height: img.height(),
     })
+}
+
+/// Whether a JPEG stores four color components (CMYK or YCCK), read from
+/// its start-of-frame header. Decoders convert such images to RGB, but the
+/// original bytes must not be kept: many readers show CMYK JPEGs inverted
+/// or not at all.
+fn jpeg_is_cmyk(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(&[0xFF, 0xD8]) {
+        return false;
+    }
+    let mut i = 2;
+    while i + 3 < bytes.len() {
+        if bytes[i] != 0xFF {
+            return false;
+        }
+        let marker = bytes[i + 1];
+        if marker == 0xFF {
+            // Fill byte.
+            i += 1;
+            continue;
+        }
+        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            i += 2;
+            continue;
+        }
+        if marker == 0xD9 || marker == 0xDA {
+            return false;
+        }
+        let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+        let is_sof = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+        if is_sof {
+            return bytes.get(i + 9) == Some(&4);
+        }
+        if len < 2 {
+            return false;
+        }
+        i += 2 + len;
+    }
+    false
 }
 
 fn blend(c: u8, a: u8) -> u8 {
@@ -779,6 +916,13 @@ fn read_local_relative(src: &str, dir: &Path) -> Result<Loaded> {
         stripped.to_string(),
         percent_decode(stripped),
     ];
+    // Windows-style separators (`sub\img.png`, or `sub%5Cimg.png` once
+    // encoded) work on every OS.
+    for c in candidates.clone() {
+        if c.contains('\\') {
+            candidates.push(c.replace('\\', "/"));
+        }
+    }
     candidates.dedup();
     for c in &candidates {
         if c.is_empty() {
@@ -1013,9 +1157,47 @@ struct ImageTag {
     hrefs: Vec<Range<usize>>,
 }
 
+/// A start tag inside SVG source.
+struct SvgTag {
+    range: Range<usize>,
+    self_closing: bool,
+    /// Lowercase local name (`image`, `style`, `use`, ...).
+    local: String,
+    attrs: Vec<SvgAttr>,
+}
+
+/// An attribute of an [`SvgTag`].
+struct SvgAttr {
+    /// Lowercase local name (`href` for `xlink:href`).
+    local: String,
+    /// The whole attribute, `name="value"`.
+    full: Range<usize>,
+    /// The value without quotes.
+    value: Range<usize>,
+}
+
 /// Finds `<image>` tags (any prefix) and their href value ranges. Comments
 /// and CDATA sections are skipped.
 fn find_image_tags(text: &str) -> Vec<ImageTag> {
+    scan_svg_tags(text)
+        .into_iter()
+        .filter(|t| t.local == "image")
+        .map(|t| ImageTag {
+            range: t.range,
+            self_closing: t.self_closing,
+            hrefs: t
+                .attrs
+                .into_iter()
+                .filter(|a| a.local == "href")
+                .map(|a| a.value)
+                .collect(),
+        })
+        .collect()
+}
+
+/// Finds every start tag (any prefix) with its attributes. Comments and
+/// CDATA sections are skipped.
+fn scan_svg_tags(text: &str) -> Vec<SvgTag> {
     let b = text.as_bytes();
     let len = b.len();
     let is_name = |c: u8| c.is_ascii_alphanumeric() || matches!(c, b':' | b'-' | b'_' | b'.');
@@ -1040,13 +1222,13 @@ fn find_image_tags(text: &str) -> Vec<ImageTag> {
             j += 1;
         }
         let name = &text[start + 1..j];
-        let local = name.rsplit(':').next().unwrap_or(name);
-        if !local.eq_ignore_ascii_case("image") || j == start + 1 {
+        let local = name.rsplit(':').next().unwrap_or(name).to_ascii_lowercase();
+        if j == start + 1 {
             i = j.max(start + 1);
             continue;
         }
         // Parse attributes up to the end of the tag.
-        let mut hrefs = Vec::new();
+        let mut attrs = Vec::new();
         let mut self_closing = false;
         let mut k = j;
         let end = loop {
@@ -1098,15 +1280,18 @@ fn find_image_tags(text: &str) -> Vec<ImageTag> {
                     vs..k
                 };
                 let attr_local = attr.rsplit(':').next().unwrap_or(attr);
-                if attr_local.eq_ignore_ascii_case("href") {
-                    hrefs.push(value);
-                }
+                attrs.push(SvgAttr {
+                    local: attr_local.to_ascii_lowercase(),
+                    full: name_start..k,
+                    value,
+                });
             }
         };
-        tags.push(ImageTag {
+        tags.push(SvgTag {
             range: start..end,
             self_closing,
-            hrefs,
+            local,
+            attrs,
         });
         i = end.max(start + 1);
     }
@@ -1226,12 +1411,112 @@ fn prepare_svg(
             edits.extend(tag_edits);
         }
     }
+    let tags = scan_svg_tags(text);
+    // External `<use>` targets are not part of the book (and renderers
+    // do not load them): remove the reference.
+    for tag in tags.iter().filter(|t| t.local == "use") {
+        for a in tag.attrs.iter().filter(|a| a.local == "href") {
+            let href = xml_unescape(&text[a.value.clone()]);
+            let href = href.trim();
+            if !href.is_empty() && !href.starts_with('#') {
+                ctx.warn(format!(
+                    "external <use> reference in SVG removed: {} (only references inside the same SVG work)",
+                    short(href)
+                ));
+                edits.push((a.full.clone(), String::new()));
+            }
+        }
+    }
+    if mode == SvgMode::Keep {
+        // A kept SVG is a book resource: its CSS references must be too.
+        for tag in &tags {
+            for a in tag.attrs.iter().filter(|a| a.local == "style") {
+                let css = xml_unescape(&text[a.value.clone()]);
+                if contains_url(&css) {
+                    let new = rewrite_css(&css, base, ctx);
+                    edits.push((a.value.clone(), xml_escape_attr(&new)));
+                }
+            }
+            if tag.local == "style" && !tag.self_closing {
+                let start = tag.range.end;
+                let end = find_end_tag(text, start, "style");
+                let content = &text[start..end];
+                if contains_url(content) {
+                    edits.push((start..end, rewrite_svg_style(content, base, ctx)));
+                }
+            }
+        }
+    }
+    // Edits inside a removed tag go with it.
+    let outer: Vec<Range<usize>> = edits.iter().map(|(r, _)| r.clone()).collect();
+    edits.retain(|(r, _)| {
+        !outer
+            .iter()
+            .any(|o| o != r && o.start <= r.start && r.end <= o.end)
+    });
     let mut out = text.to_string();
     edits.sort_by_key(|(r, _)| std::cmp::Reverse(r.start));
     for (r, new) in edits {
         out.replace_range(r, &new);
     }
     Ok(out)
+}
+
+/// Byte offset of the end tag `</prefix:name>` (any prefix) at or after
+/// `from`, skipping CDATA sections and comments; the text length if none.
+fn find_end_tag(text: &str, from: usize, name: &str) -> usize {
+    let mut i = from;
+    while let Some(off) = text[i..].find('<') {
+        let at = i + off;
+        let rest = &text[at..];
+        if rest.starts_with("<![CDATA[") {
+            i = rest.find("]]>").map_or(text.len(), |e| at + e + 3);
+            continue;
+        }
+        if rest.starts_with("<!--") {
+            i = rest.find("-->").map_or(text.len(), |e| at + e + 3);
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("</") {
+            let tag: String = after
+                .chars()
+                .take_while(|c| !c.is_whitespace() && *c != '>')
+                .collect();
+            if tag
+                .rsplit(':')
+                .next()
+                .unwrap_or(&tag)
+                .eq_ignore_ascii_case(name)
+            {
+                return at;
+            }
+        }
+        i = at + 1;
+    }
+    text.len()
+}
+
+/// Rewrites the CSS inside an SVG `<style>` element (CDATA sections are
+/// rewritten as they are; plain text is unescaped and escaped again).
+fn rewrite_svg_style(content: &str, base: &Base, ctx: &mut Ctx) -> String {
+    if !content.contains("<![CDATA[") {
+        let css = xml_unescape(content);
+        return rewrite_css(&css, base, ctx)
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(i) = rest.find("<![CDATA[") {
+        out.push_str(&rest[..i + 9]);
+        let after = &rest[i + 9..];
+        let end = after.find("]]>").unwrap_or(after.len());
+        out.push_str(&rewrite_css(&after[..end], base, ctx));
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn is_inline_raster(href: &str) -> bool {
@@ -1285,8 +1570,10 @@ fn resolve_svg_ref(
 // CSS url(...)
 // ---------------------------------------------------------------------------
 
+/// Whether CSS text has anything [`rewrite_css`] would change.
 fn contains_url(css: &str) -> bool {
-    css.to_ascii_lowercase().contains("url(")
+    let lower = css.to_ascii_lowercase();
+    lower.contains("url(") || lower.contains("@import")
 }
 
 /// Parses the argument of a `url(` starting at byte `open` (just after the
@@ -1388,54 +1675,172 @@ fn css_escape_string(s: &str) -> String {
     out
 }
 
+/// Rewrites the `url(...)` references of the user's `--css` stylesheet
+/// (read from `dir`) to stored book resources, exactly as for `<style>`
+/// blocks. The resulting paths (`../images/...`, `../fonts/...`) are valid
+/// from `OEBPS/css/` as well as from `OEBPS/text/`.
+pub fn rewrite_user_css(css: &str, dir: &Path, ctx: &mut Ctx) -> String {
+    let base = Base::Dir(dir.to_path_buf());
+    rewrite_css(css, &base, ctx)
+}
+
+/// Index just past the end of the `@import` rule (or declaration) starting
+/// at `from`: after the next `;` outside strings and parentheses, or at a
+/// `}` (not consumed), or at the end of the text.
+fn statement_end(css: &str, from: usize) -> (usize, bool) {
+    let b = css.as_bytes();
+    let mut i = from;
+    let mut paren = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'"' | b'\'' => i = skip_css_string(b, i),
+            b'/' if b.get(i + 1) == Some(&b'*') => i = skip_css_comment(css, i),
+            b'(' => {
+                paren += 1;
+                i += 1;
+            }
+            b')' => {
+                paren = paren.saturating_sub(1);
+                i += 1;
+            }
+            b';' if paren == 0 => return (i + 1, true),
+            b'}' if paren == 0 => return (i, false),
+            _ => i += 1,
+        }
+    }
+    (b.len(), false)
+}
+
+/// Index just past a quoted CSS string starting at `start`.
+fn skip_css_string(b: &[u8], start: usize) -> usize {
+    let q = b[start];
+    let mut i = start + 1;
+    while i < b.len() && b[i] != q {
+        if b[i] == b'\\' {
+            i += 1;
+        } else if b[i] == b'\n' {
+            // An unterminated string ends at the line end.
+            return i;
+        }
+        i += 1;
+    }
+    (i + 1).min(b.len())
+}
+
+/// Index just past a `/* ... */` comment starting at `start`.
+fn skip_css_comment(css: &str, start: usize) -> usize {
+    css[start + 2..]
+        .find("*/")
+        .map_or(css.len(), |e| start + 2 + e + 2)
+}
+
+/// The stylesheet an `@import` prelude names (for messages).
+fn import_target(prelude: &str) -> String {
+    let p = prelude.trim();
+    let lower = p.to_ascii_lowercase();
+    if lower.starts_with("url(")
+        && let Some((v, _)) = parse_css_url(p, 4)
+    {
+        return v;
+    }
+    let p = p.trim_start_matches(['"', '\'']);
+    p.split(['"', '\'', ';', ' '])
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Rewrites every `url(...)` in CSS text to a stored book resource, or to
-/// `none` (with a warning) when it cannot be resolved. Fragment-only URLs
-/// (`url(#id)`) are left alone.
+/// `none` (with a warning) when it cannot be resolved; an unresolvable
+/// `src` descriptor (`@font-face`) is removed with its declaration, since
+/// `src: none` is invalid. Fragment-only URLs (`url(#id)`) are left alone,
+/// comments and strings are copied untouched, and `@import` rules are
+/// removed with a warning.
 fn rewrite_css(css: &str, base: &Base, ctx: &mut Ctx) -> String {
-    let lower = css.to_ascii_lowercase();
     let b = css.as_bytes();
     let mut out = String::with_capacity(css.len());
     let mut i = 0;
-    while let Some(p) = lower[i..].find("url(") {
-        let start = i + p;
-        let open = start + 4;
-        let ident_before = start > 0 && {
-            let c = b[start - 1];
-            c.is_ascii_alphanumeric() || c == b'-' || c == b'_'
-        };
-        let parsed = if ident_before {
-            None
-        } else {
-            parse_css_url(css, open)
-        };
-        let Some((value, end)) = parsed else {
-            out.push_str(&css[i..open]);
-            i = open;
-            continue;
-        };
-        out.push_str(&css[i..start]);
-        let value = value.trim();
-        if value.is_empty() || value.starts_with('#') {
-            out.push_str(&css[start..end]);
-        } else {
-            match resolve_css_url(value, base, ctx) {
-                Ok(url) => {
-                    out.push_str("url(\"");
-                    out.push_str(&css_escape_string(&url));
-                    out.push_str("\")");
-                }
-                Err(e) => {
-                    ctx.warn(format!(
-                        "CSS resource not embedded: {} ({e:#})",
-                        short(value)
-                    ));
-                    out.push_str("none");
-                }
+    let mut copied = 0;
+    // Where the current declaration starts in `out`.
+    let mut decl_start = 0;
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'-' || c == b'_';
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'*') => i = skip_css_comment(css, i),
+            b'"' | b'\'' => i = skip_css_string(b, i),
+            b';' | b'{' | b'}' => {
+                i += 1;
+                out.push_str(&css[copied..i]);
+                copied = i;
+                decl_start = out.len();
             }
+            b'@' if css[i..]
+                .get(..7)
+                .is_some_and(|h| h.eq_ignore_ascii_case("@import"))
+                && !b.get(i + 7).copied().is_some_and(is_ident) =>
+            {
+                let (end, _) = statement_end(css, i + 7);
+                let target = import_target(css[i + 7..end].trim_end_matches(';'));
+                out.push_str(&css[copied..i]);
+                ctx.warn(format!(
+                    "imported stylesheet '{}' ignored (add it with --css)",
+                    short(&target)
+                ));
+                i = end;
+                copied = end;
+            }
+            b'u' | b'U'
+                if css[i..]
+                    .get(..4)
+                    .is_some_and(|h| h.eq_ignore_ascii_case("url("))
+                    && !(i > 0 && is_ident(b[i - 1])) =>
+            {
+                let Some((value, end)) = parse_css_url(css, i + 4) else {
+                    i += 4;
+                    continue;
+                };
+                out.push_str(&css[copied..i]);
+                let value = value.trim();
+                if value.is_empty() || value.starts_with('#') {
+                    out.push_str(&css[i..end]);
+                    i = end;
+                    copied = end;
+                    continue;
+                }
+                match resolve_css_url(value, base, ctx) {
+                    Ok(url) => {
+                        out.push_str("url(\"");
+                        out.push_str(&css_escape_string(&url));
+                        out.push_str("\")");
+                        i = end;
+                    }
+                    Err(e) => {
+                        ctx.warn(format!(
+                            "CSS resource not embedded: {} ({e:#})",
+                            short(value)
+                        ));
+                        let prop = out[decl_start..]
+                            .split(':')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_ascii_lowercase();
+                        if out[decl_start..].contains(':') && prop == "src" {
+                            out.truncate(decl_start);
+                            let (decl_end, _) = statement_end(css, end);
+                            i = decl_end;
+                        } else {
+                            out.push_str("none");
+                            i = end;
+                        }
+                    }
+                }
+                copied = i;
+            }
+            _ => i += 1,
         }
-        i = end;
     }
-    out.push_str(&css[i..]);
+    out.push_str(&css[copied.min(css.len())..]);
     out
 }
 
@@ -2008,5 +2413,189 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// A PNG whose header claims `w`×`h` pixels (the pixel data is junk:
+    /// the size check must fire before anything is decoded).
+    fn png_header_only(w: u32, h: u32) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut crc = flate2::Crc::new();
+            crc.update(kind);
+            crc.update(data);
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            out.extend_from_slice(&crc.sum().to_be_bytes());
+        }
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        chunk(&mut out, b"IHDR", &ihdr);
+        chunk(&mut out, b"IDAT", &[0x78, 0x9c, 0x03, 0x00]);
+        chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    fn decompression_bombs_are_refused_before_decoding() {
+        let bomb = png_header_only(60_000, 60_000);
+        let err = process_raster(bomb.clone(), RasterOpts::for_ctx(&ctx()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too large"), "{err}");
+        let mut ctx = ctx();
+        let uri = data_uri("image/png", &bomb);
+        let out = run(&format!(r#"<img src="{uri}" alt="bomb">"#), &mut ctx);
+        assert!(out.contains(">bomb<"), "{out}");
+        assert_eq!(ctx.warnings().len(), 1, "{:?}", ctx.warnings());
+        assert!(ctx.warnings()[0].contains("too large"));
+    }
+
+    #[test]
+    fn cmyk_jpegs_are_converted_to_rgb() {
+        let bytes = std::fs::read(fixtures().join("images/cmyk.jpg")).unwrap();
+        assert!(jpeg_is_cmyk(&bytes));
+        let rgb = encode(DynamicImage::new_rgb8(4, 4), ImageFormat::Jpeg);
+        assert!(!jpeg_is_cmyk(&rgb));
+        assert!(!jpeg_is_cmyk(b"\xFF\xD8\xFF"));
+        assert!(!jpeg_is_cmyk(b"not a jpeg"));
+        let out = process_raster(bytes.clone(), RasterOpts::for_ctx(&ctx())).unwrap();
+        assert_ne!(out.bytes, bytes, "CMYK JPEG kept byte for byte");
+        assert_eq!(out.ext, "jpg");
+        assert!(!jpeg_is_cmyk(&out.bytes));
+        let img = image::load_from_memory(&out.bytes).unwrap();
+        assert_eq!(img.color(), ColorType::Rgb8);
+        // (0, 200, 200, 0) CMYK is red-ish.
+        let p = img.to_rgb8().get_pixel(8, 6).0;
+        assert!(p[0] > 200 && p[1] < 120 && p[2] < 120, "{p:?}");
+    }
+
+    #[test]
+    fn srcset_and_picture_sources_are_fallbacks() {
+        let mut ctx = ctx();
+        let doc = dom::parse(
+            r#"<img alt="only srcset" srcset="images/missing.png 1x, images/chart.png 2x">
+            <picture><source srcset="images/sample.webp"><img src="gone.png" alt="pic"></picture>
+            <img alt="none at all">"#,
+        );
+        crate::html::sanitize(&doc, &mut ctx).unwrap();
+        transform(&doc, &mut ctx).unwrap();
+        let out = dom::serialize_inner_xhtml(&dom::body(&doc).unwrap());
+        assert_eq!(out.matches("<img").count(), 2, "{out}");
+        assert!(!out.contains("md2epub"), "{out}");
+        assert!(
+            out.contains(r#"alt="only srcset""#) && out.contains(r#"alt="pic""#),
+            "{out}"
+        );
+        assert!(out.contains(">none at all<"), "{out}");
+        assert_eq!(ctx.warnings().len(), 1, "{:?}", ctx.warnings());
+        assert_eq!(
+            srcset_candidates("a.png 1x, b.png 3x,c.png 2x, data:image/png;base64,AA 640w"),
+            ["data:image/png;base64,AA", "b.png", "c.png", "a.png"]
+        );
+        assert_eq!(srcset_candidates("x.png, y.png"), ["x.png", "y.png"]);
+        assert!(srcset_candidates("  , ").is_empty());
+    }
+
+    #[test]
+    fn backslash_paths_resolve() {
+        let mut ctx = ctx();
+        let doc = dom::parse(
+            r#"<img src="images\chart.png" alt="a"><p>![x](images%5Cchart.png)</p><img src="images%5Cchart.png" alt="b">"#,
+        );
+        crate::html::sanitize(&doc, &mut ctx).unwrap();
+        transform(&doc, &mut ctx).unwrap();
+        let out = dom::serialize_inner_xhtml(&dom::body(&doc).unwrap());
+        assert_eq!(out.matches("../images/").count(), 2, "{out}");
+        assert!(ctx.warnings().is_empty(), "{:?}", ctx.warnings());
+    }
+
+    #[test]
+    fn css_comments_strings_imports_and_font_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            fixtures().join("images/chart.png"),
+            dir.path().join("p.png"),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("other.css"), "p{}").unwrap();
+        let mut ctx = ctx();
+        ctx.base_dir = dir.path().to_path_buf();
+        let out = run(
+            r#"<p>x</p><style>.d{content:"url(p.png)"} /* url(p.png) in comment */ @import url(other.css); @IMPORT "x.css" screen;
+            @font-face{font-family:G;src:url(g.woff2) format("woff2");font-weight:bold} .q{display:flex} .b{background:url(p.png)}</style>"#,
+            &mut ctx,
+        );
+        assert!(out.contains(r#".d{content:"url(p.png)"}"#), "{out}");
+        assert!(out.contains("/* url(p.png) in comment */"), "{out}");
+        assert!(!out.to_ascii_lowercase().contains("@import"), "{out}");
+        assert!(!out.contains("none"), "{out}");
+        assert!(
+            out.contains("@font-face{font-family:G;font-weight:bold}"),
+            "{out}"
+        );
+        assert!(out.contains(".q{display:flex}"), "{out}");
+        assert_eq!(ctx.resources().len(), 1);
+        assert!(
+            out.contains(&format!("url(\"../{}\")", ctx.resources()[0].href)),
+            "{out}"
+        );
+        let w = ctx.warnings();
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(
+            w[0].contains("other.css") && w[0].contains("--css"),
+            "{w:?}"
+        );
+        assert!(w[1].contains("x.css"), "{w:?}");
+        assert!(w[2].contains("g.woff2"), "{w:?}");
+    }
+
+    #[test]
+    fn kept_svgs_have_no_dangling_references() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            fixtures().join("images/chart.png"),
+            dir.path().join("pat.png"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("a.svg"),
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="10" height="10"><style>@import url(foo.css); rect{fill:url(pat.png)} .m{fill:url(missing.png)} .g{fill:url(#grad)}</style><use href="b.svg#shape"/><use xlink:href="#local"/><rect style="fill:url(pat.png)" width="5" height="5"/><style><![CDATA[ .c{background:url(pat.png)} ]]></style></svg>"##,
+        )
+        .unwrap();
+        let mut ctx = ctx();
+        ctx.base_dir = dir.path().to_path_buf();
+        let out = run(r#"<img src="a.svg" alt="s">"#, &mut ctx);
+        assert!(out.contains(".svg"), "{out}");
+        let svg = ctx
+            .resources()
+            .iter()
+            .find(|r| r.media_type == "image/svg+xml")
+            .unwrap();
+        let text = String::from_utf8(svg.data.clone()).unwrap();
+        roxmltree::Document::parse(&text).unwrap();
+        let png = ctx
+            .resources()
+            .iter()
+            .find(|r| r.media_type == "image/png")
+            .unwrap();
+        let rel = format!("../{}", png.href);
+        assert!(
+            !text.contains("foo.css") && !text.contains("@import"),
+            "{text}"
+        );
+        assert!(!text.contains("b.svg"), "{text}");
+        assert!(text.contains("#local"), "{text}");
+        assert!(text.contains("url(#grad)"), "{text}");
+        assert!(
+            !text.contains("pat.png") && !text.contains("missing.png"),
+            "{text}"
+        );
+        assert_eq!(text.matches(&rel).count(), 3, "{text}");
+        assert!(text.contains("<![CDATA["), "{text}");
+        let w = ctx.warnings();
+        assert_eq!(w.len(), 3, "{w:?}");
     }
 }

@@ -234,6 +234,10 @@ pub struct Options {
     pub verbose: bool,
     /// Output path. `None` means "first input's stem + `.epub`" in the CWD.
     pub output: Option<PathBuf>,
+    /// Whether `meta.lang` was given explicitly (flag, `book.toml` or front
+    /// matter). When it was not, the `<html lang>` of the first HTML input
+    /// may set the book language.
+    pub lang_given: bool,
 }
 
 impl Default for Options {
@@ -259,6 +263,7 @@ impl Default for Options {
             extra_css: None,
             verbose: false,
             output: None,
+            lang_given: false,
         }
     }
 }

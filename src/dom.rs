@@ -25,6 +25,8 @@ pub const SVG_NS: &str = "http://www.w3.org/2000/svg";
 pub const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 pub const XLINK_NS: &str = "http://www.w3.org/1999/xlink";
 pub const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+/// EPUB structural semantics vocabulary (`epub:type`).
+pub const OPS_NS: &str = "http://www.idpf.org/2007/ops";
 
 /// HTML void elements: serialized as `<name ... />`.
 const VOID_ELEMENTS: &[&str] = &[
@@ -43,9 +45,61 @@ const VOID_ELEMENTS: &[&str] = &[
 /// Note that `<style>`, `<title>`, `<meta>` and `<link>` appearing before
 /// any body content are placed in `<head>` (standard HTML parsing); the
 /// sanitizer is expected to carry `<head>` styles over into the body.
+///
+/// Input without a doctype (fragments, Markdown output, careless HTML) gets
+/// `<!DOCTYPE html>` prepended, so html5ever parses it in no-quirks mode
+/// (where, for example, `<p>text<table>` closes the paragraph, as XHTML
+/// requires).
 pub fn parse(html: &str) -> Handle {
-    let dom = html5ever::parse_document(RcDom::default(), ParseOpts::default()).one(html);
+    let dom = if has_doctype(html) {
+        html5ever::parse_document(RcDom::default(), ParseOpts::default()).one(html)
+    } else {
+        let mut with = String::with_capacity(html.len() + 16);
+        with.push_str("<!DOCTYPE html>");
+        with.push_str(html);
+        html5ever::parse_document(RcDom::default(), ParseOpts::default()).one(with)
+    };
     dom.document
+}
+
+/// Whether a doctype comes before the first element (skipping a BOM,
+/// whitespace, comments and an XML declaration).
+fn has_doctype(html: &str) -> bool {
+    let mut s = html.trim_start_matches('\u{feff}').trim_start();
+    loop {
+        if let Some(rest) = s.strip_prefix("<!--") {
+            match rest.find("-->") {
+                Some(i) => s = rest[i + 3..].trim_start(),
+                None => return false,
+            }
+        } else if s.starts_with("<?") {
+            match s.find("?>") {
+                Some(i) => s = s[i + 2..].trim_start(),
+                None => return false,
+            }
+        } else {
+            return s
+                .get(..9)
+                .is_some_and(|h| h.eq_ignore_ascii_case("<!doctype"));
+        }
+    }
+}
+
+/// Depth of the deepest node below `root` (children of `root` are at depth
+/// 1). Iterative, so it is safe on any input.
+pub fn max_depth(root: &Handle) -> usize {
+    let mut max = 0;
+    let mut stack: Vec<(Handle, usize)> = root
+        .children
+        .borrow()
+        .iter()
+        .map(|c| (c.clone(), 1))
+        .collect();
+    while let Some((n, d)) = stack.pop() {
+        max = max.max(d);
+        stack.extend(n.children.borrow().iter().map(|c| (c.clone(), d + 1)));
+    }
+    max
 }
 
 /// Parses an HTML fragment in a `<body>` context and returns its top-level
@@ -247,6 +301,11 @@ fn attr_qualname(name: &str) -> QualName {
         Some(("xml", local)) => QualName::new(
             Some(html5ever::Prefix::from("xml")),
             ns!(xml),
+            LocalName::from(local),
+        ),
+        Some(("epub", local)) => QualName::new(
+            Some(html5ever::Prefix::from("epub")),
+            html5ever::Namespace::from(OPS_NS),
             LocalName::from(local),
         ),
         _ => QualName::new(None, ns!(), LocalName::from(name)),
@@ -466,6 +525,7 @@ fn write_element(
         out.push('"');
     }
     let mut wrote_xlink_decl = false;
+    let mut wrote_epub_decl = false;
     let mut seen: Vec<String> = Vec::new();
     for a in attrs {
         let Some(attr_name) = xml_attr_name(a) else {
@@ -479,6 +539,14 @@ fn write_element(
             out.push_str(XLINK_NS);
             out.push('"');
             wrote_xlink_decl = true;
+        }
+        if attr_name.starts_with("epub:") && !wrote_epub_decl {
+            // Redundant inside a chapter (the wrapper declares it), but it
+            // keeps every serialized fragment well-formed on its own.
+            out.push_str(" xmlns:epub=\"");
+            out.push_str(OPS_NS);
+            out.push('"');
+            wrote_epub_decl = true;
         }
         out.push(' ');
         out.push_str(&attr_name);
@@ -520,6 +588,12 @@ fn xml_attr_name(a: &Attribute) -> Option<String> {
     }
     if ns == XML_NS {
         return is_xml_ncname(local).then(|| format!("xml:{local}"));
+    }
+    if ns == OPS_NS {
+        return is_xml_ncname(local).then(|| format!("epub:{local}"));
+    }
+    if let Some(rest) = local.strip_prefix("epub:") {
+        return is_xml_ncname(rest).then(|| format!("epub:{rest}"));
     }
     if let Some(rest) = local.strip_prefix("xlink:") {
         return is_xml_ncname(rest).then(|| format!("xlink:{rest}"));
@@ -601,6 +675,49 @@ mod tests {
     fn body_xhtml(html: &str) -> String {
         let doc = parse(html);
         serialize_inner_xhtml(&body(&doc).unwrap())
+    }
+
+    #[test]
+    fn no_doctype_parses_in_no_quirks_mode() {
+        // Quirks mode would keep the table inside the paragraph.
+        let out = body_xhtml("<p>para <table><tr><td>x</td></tr></table>");
+        assert!(out.starts_with("<p>para </p><table>"), "{out}");
+        let out = body_xhtml("<!-- c --><?xml version=\"1.0\"?><p>a<table></table>");
+        assert!(out.starts_with("<p>a</p><table>"), "{out}");
+        assert!(has_doctype("\u{feff} <!-- x --><!doctype html><p>"));
+        assert!(has_doctype("<?xml version=\"1.0\"?>\n<!DOCTYPE html>"));
+        assert!(!has_doctype("<p>x</p>"));
+        assert!(!has_doctype("<!-- unterminated"));
+    }
+
+    #[test]
+    fn max_depth_is_iterative() {
+        let deep = "<div>".repeat(3_000);
+        let doc = parse(&deep);
+        // html > body > 3 000 divs.
+        assert!(max_depth(&doc) >= 3_000);
+        assert_eq!(max_depth(&create_element("p", &[])), 0);
+    }
+
+    #[test]
+    fn epub_type_attributes_are_namespaced() {
+        let doc = parse(r##"<p><a epub:type="noteref" href="#n">1</a></p>"##);
+        let a = first_by_tag(&doc, "a").unwrap();
+        assert_eq!(get_attr(&a, "epub:type").as_deref(), Some("noteref"));
+        let span = create_element("span", &[("epub:type", "footnote")]);
+        append_child(&body(&doc).unwrap(), &span);
+        let out = serialize_inner_xhtml(&body(&doc).unwrap());
+        assert_well_formed(&out);
+        assert!(
+            out.contains(r#"<a xmlns:epub="http://www.idpf.org/2007/ops" epub:type="noteref""#),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                r#"<span xmlns:epub="http://www.idpf.org/2007/ops" epub:type="footnote"/>"#
+            ) || out.contains(r#"epub:type="footnote"></span>"#),
+            "{out}"
+        );
     }
 
     #[test]

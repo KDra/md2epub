@@ -43,6 +43,9 @@ pub struct Ctx {
     pub used_ids: HashSet<String>,
     /// Number of chapter files allocated so far (see [`Ctx::next_chapter_file`]).
     pub chapter_count: usize,
+    /// Language of the input currently being processed (an HTML input's
+    /// `<html lang>`, normalized), set by `html::sanitize`.
+    pub input_lang: Option<String>,
     resources: Vec<Resource>,
     by_href: HashMap<String, usize>,
     warnings: Vec<String>,
@@ -58,6 +61,7 @@ impl Ctx {
             title_hint: None,
             used_ids: HashSet::new(),
             chapter_count: 0,
+            input_lang: None,
             resources: Vec::new(),
             by_href: HashMap::new(),
             warnings: Vec::new(),
@@ -103,10 +107,38 @@ impl Ctx {
     /// `resources_dir` is where the SVG's own relative image references
     /// resolve. The returned size is the display size in CSS pixels.
     pub fn add_vector_in(&mut self, svg: &str, resources_dir: Option<&Path>) -> Result<ImgRef> {
+        self.add_vector_scaled(svg, resources_dir, SVG_RASTER_SCALE)
+    }
+
+    /// Like [`Ctx::add_vector_in`], rasterizing at `scale` times the SVG's
+    /// nominal size (math uses a higher scale than diagrams, so formulas
+    /// stay sharp when the reader enlarges the text).
+    ///
+    /// Under `SvgMode::Rasterize`, `<foreignObject>` content (HTML, which
+    /// the rasterizer cannot draw) is replaced by its plain text and a
+    /// warning is recorded.
+    pub fn add_vector_scaled(
+        &mut self,
+        svg: &str,
+        resources_dir: Option<&Path>,
+        scale: f32,
+    ) -> Result<ImgRef> {
         let (w, h) = (self.opts.profile.screen_w, self.opts.profile.screen_h);
         match self.opts.svg {
             SvgMode::Rasterize => {
-                let raster = svg::rasterize(svg.as_bytes(), resources_dir, w, h, SVG_RASTER_SCALE)
+                let replaced;
+                let svg = match svg::replace_foreign_objects(svg) {
+                    Some(text) => {
+                        self.warn(
+                            "SVG contains <foreignObject> (HTML content) that cannot be rasterized; \
+                             it was replaced by its plain text",
+                        );
+                        replaced = text;
+                        replaced.as_str()
+                    }
+                    None => svg,
+                };
+                let raster = svg::rasterize(svg.as_bytes(), resources_dir, w, h, scale)
                     .context("rasterizing SVG")?;
                 let png = if self.opts.grayscale {
                     to_grayscale_png(&raster.png)?
@@ -116,8 +148,8 @@ impl Ctx {
                 let src = self.add_image(png, "png");
                 Ok(ImgRef {
                     src,
-                    width_px: ((raster.width as f32 / SVG_RASTER_SCALE).round() as u32).max(1),
-                    height_px: ((raster.height as f32 / SVG_RASTER_SCALE).round() as u32).max(1),
+                    width_px: ((raster.width as f32 / scale).round() as u32).max(1),
+                    height_px: ((raster.height as f32 / scale).round() as u32).max(1),
                 })
             }
             SvgMode::Keep => {
@@ -285,5 +317,19 @@ mod tests {
         assert_eq!(fit_within(100.0, 50.0, 1000.0, 1000.0), (100, 50));
         assert_eq!(fit_within(4000.0, 2000.0, 1000.0, 1000.0), (1000, 500));
         assert_eq!(fit_within(0.0, 0.0, 10.0, 10.0), (1, 1));
+    }
+
+    #[test]
+    fn foreign_objects_warn_when_rasterized() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><foreignObject width="20" height="20"><div xmlns="http://www.w3.org/1999/xhtml">hi</div></foreignObject></svg>"#;
+        let mut ctx = Ctx::new(Options::default());
+        ctx.opts.svg = SvgMode::Rasterize;
+        ctx.add_vector(svg).unwrap();
+        assert_eq!(ctx.warnings().len(), 1, "{:?}", ctx.warnings());
+        assert!(ctx.warnings()[0].contains("foreignObject"));
+        // Kept SVGs are left alone.
+        let mut ctx = Ctx::new(Options::default());
+        ctx.add_vector(svg).unwrap();
+        assert!(ctx.warnings().is_empty());
     }
 }
