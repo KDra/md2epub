@@ -19,9 +19,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::cli::Cli;
+use crate::config::UserConfig;
 use crate::ctx::Ctx;
 use crate::markdown::{self, Rendered};
-use crate::model::{Book, Options};
+use crate::model::{Book, Options, OutputLocation};
 use crate::{assets, config, dom, epub, html, math, mermaid, notes, style};
 
 /// Stack size of the conversion thread. The DOM stages walk the tree
@@ -70,16 +71,21 @@ pub struct Report {
     /// Whether the run was verbose (warnings were then already printed as
     /// they happened).
     pub verbose: bool,
+    /// Informational notes for the user (not warnings), such as `.epub`
+    /// having been added to the output name.
+    pub notices: Vec<String>,
 }
 
 /// Runs the whole conversion for a parsed command line, on a thread with a
-/// large stack (see [`PIPELINE_STACK`]).
-pub fn run(cli: &Cli) -> Result<Report> {
+/// large stack (see [`PIPELINE_STACK`]). `user` holds the user defaults
+/// (see [`crate::user_config`]).
+pub fn run(cli: &Cli, user: &UserConfig) -> Result<Report> {
     let cli = cli.clone();
+    let user = user.clone();
     let handle = std::thread::Builder::new()
         .name("md2epub".into())
         .stack_size(PIPELINE_STACK)
-        .spawn(move || run_on_this_thread(&cli))
+        .spawn(move || run_on_this_thread(&cli, &user))
         .context("starting the conversion thread")?;
     match handle.join() {
         Ok(result) => result,
@@ -95,10 +101,10 @@ pub fn run(cli: &Cli) -> Result<Report> {
 }
 
 /// Runs the whole conversion on the calling thread.
-pub fn run_on_this_thread(cli: &Cli) -> Result<Report> {
+pub fn run_on_this_thread(cli: &Cli, user: &UserConfig) -> Result<Report> {
     // First pass learns the inputs; the second applies the front matter of
     // the first Markdown input.
-    let (_, inputs) = config::resolve(cli, None)?;
+    let (_, inputs) = config::resolve_with(cli, None, user)?;
     let first = inputs.first().context("no input files")?;
     let mut first_rendered = None;
     if InputKind::of(first)? == InputKind::Markdown {
@@ -107,25 +113,17 @@ pub fn run_on_this_thread(cli: &Cli) -> Result<Report> {
     let front_matter = first_rendered
         .as_ref()
         .and_then(|r| r.front_matter.as_deref());
-    let (opts, inputs) = config::resolve(cli, front_matter)?;
-    let out = output_path(&opts, &inputs);
+    let (opts, inputs) = config::resolve_with(cli, front_matter, user)?;
+    let (out, notice) = output_path(&opts, &inputs);
     check_output(&out, &inputs, &opts)?;
-    let (book, mut ctx) = build_book(opts, &inputs, first_rendered)?;
-    let is_epub = out
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("epub"));
-    if !is_epub {
-        ctx.warn(format!(
-            "output file {} does not end in .epub; readers and Send to Kindle may not recognize it",
-            out.display()
-        ));
-    }
+    let (book, ctx) = build_book(opts, &inputs, first_rendered)?;
     epub::write(&book, &out)?;
     Ok(Report {
         output: out,
         chapters: book.chapters.len(),
         warnings: ctx.warnings().to_vec(),
         verbose: ctx.opts.verbose,
+        notices: notice.into_iter().collect(),
     })
 }
 
@@ -170,18 +168,58 @@ fn normalized_output(out: &Path) -> PathBuf {
     }
 }
 
-/// Where the EPUB goes: `opts.output`, else the first input's stem with
-/// `.epub` in the current directory.
-pub fn output_path(opts: &Options, inputs: &[PathBuf]) -> PathBuf {
-    if let Some(o) = &opts.output {
-        return o.clone();
-    }
-    let stem = inputs
-        .first()
+/// Where the EPUB goes, plus a note for the user when the given name was
+/// changed. With `name.epub` = the first input's stem plus `.epub`:
+///
+/// - no output path: `name.epub` in the current directory
+///   ([`OutputLocation::Cwd`]) or beside the first input
+///   ([`OutputLocation::Input`]);
+/// - an existing directory, or a path ending in a separator: `name.epub`
+///   inside it (the directory is created when the book is written);
+/// - a name ending in `.epub` (any case): used as given;
+/// - no extension (`-o book`): `.epub` is added (`book.epub`);
+/// - another extension (`-o notes.txt`): `.epub` is added
+///   (`notes.txt.epub`) and the note says so.
+pub fn output_path(opts: &Options, inputs: &[PathBuf]) -> (PathBuf, Option<String>) {
+    let first = inputs.first();
+    let stem = first
         .and_then(|p| p.file_stem())
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "book".into());
-    PathBuf::from(format!("{stem}.epub"))
+    let default_name = format!("{stem}.epub");
+    let Some(out) = &opts.output else {
+        let path = match (opts.output_location, first.and_then(|p| p.parent())) {
+            (OutputLocation::Input, Some(dir)) if !dir.as_os_str().is_empty() => {
+                dir.join(default_name)
+            }
+            _ => PathBuf::from(default_name),
+        };
+        return (path, None);
+    };
+    let ends_with_separator = out
+        .to_string_lossy()
+        .chars()
+        .last()
+        .is_some_and(std::path::is_separator);
+    if ends_with_separator || out.is_dir() {
+        return (out.join(default_name), None);
+    }
+    let Some(name) = out.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return (out.join(default_name), None);
+    };
+    let lower = name.to_ascii_lowercase();
+    if lower.len() > ".epub".len() && lower.ends_with(".epub") {
+        return (out.clone(), None);
+    }
+    let fixed = out.with_file_name(format!("{name}.epub"));
+    let notice = Path::new(&name).extension().map(|_| {
+        format!(
+            "output name {} does not end in .epub; writing {}",
+            out.display(),
+            fixed.display()
+        )
+    });
+    (fixed, notice)
 }
 
 /// Converts the inputs into an in-memory [`Book`]. `first_rendered` may hold
@@ -388,14 +426,116 @@ mod tests {
             ..Options::default()
         };
         let inputs = vec![fixture("kitchen-sink.md")];
-        assert_eq!(output_path(&opts, &inputs), out);
+        assert_eq!(output_path(&opts, &inputs), (out.clone(), None));
         let (book, _) = build_book(opts, &inputs, None).unwrap();
         epub::write(&book, &out).unwrap();
         assert!(out.is_file());
         assert_eq!(
             output_path(&Options::default(), &inputs),
-            PathBuf::from("kitchen-sink.epub")
+            (PathBuf::from("kitchen-sink.epub"), None)
         );
+    }
+
+    fn out_for(output: Option<&Path>, location: OutputLocation, input: &str) -> PathBuf {
+        let opts = Options {
+            output: output.map(Path::to_path_buf),
+            output_location: location,
+            ..Options::default()
+        };
+        output_path(&opts, &[PathBuf::from(input)]).0
+    }
+
+    #[test]
+    fn output_path_rules() {
+        use OutputLocation::{Cwd, Input};
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // No -o: current directory or beside the first input.
+        assert_eq!(out_for(None, Cwd, "src/a.md"), PathBuf::from("a.epub"));
+        assert_eq!(
+            out_for(None, Input, "src/a.md"),
+            PathBuf::from("src/a.epub")
+        );
+        assert_eq!(out_for(None, Input, "a.md"), PathBuf::from("a.epub"));
+        // .epub is kept, in any case.
+        assert_eq!(
+            out_for(Some(Path::new("x/B.EPUB")), Input, "a.md"),
+            PathBuf::from("x/B.EPUB")
+        );
+        // No extension: .epub is added silently.
+        let opts = Options {
+            output: Some("out/book".into()),
+            ..Options::default()
+        };
+        assert_eq!(
+            output_path(&opts, &[PathBuf::from("a.md")]),
+            (PathBuf::from("out/book.epub"), None)
+        );
+        // Another extension: .epub is appended, with a note.
+        let opts = Options {
+            output: Some("notes.txt".into()),
+            ..Options::default()
+        };
+        let (path, note) = output_path(&opts, &[PathBuf::from("a.md")]);
+        assert_eq!(path, PathBuf::from("notes.txt.epub"));
+        assert!(note.unwrap().contains("notes.txt.epub"));
+        // An existing directory, or a path ending in a separator.
+        assert_eq!(out_for(Some(d), Cwd, "x/a.md"), d.join("a.epub"));
+        let new_dir = format!("{}/new/", d.display());
+        assert_eq!(
+            out_for(Some(Path::new(&new_dir)), Cwd, "x/a.md"),
+            d.join("new").join("a.epub")
+        );
+        // The -o location wins over output-location.
+        assert_eq!(out_for(Some(d), Input, "x/a.md"), d.join("a.epub"));
+    }
+
+    #[test]
+    fn output_directory_is_created_and_input_is_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let md = dir.path().join("c.md");
+        std::fs::write(&md, "# C\n").unwrap();
+        let out_dir = format!("{}/made/", dir.path().display());
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "md2epub",
+            md.to_str().unwrap(),
+            "--offline",
+            "-o",
+            &out_dir,
+        ])
+        .unwrap();
+        let report = run_on_this_thread(&cli, &UserConfig::default()).unwrap();
+        assert_eq!(report.output, dir.path().join("made").join("c.epub"));
+        assert!(report.output.is_file());
+        // `-o c` next to `c.md` gives `c.epub`, never the input itself.
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "md2epub",
+            md.to_str().unwrap(),
+            "--offline",
+            "-o",
+            dir.path().join("c").to_str().unwrap(),
+        ])
+        .unwrap();
+        let report = run_on_this_thread(&cli, &UserConfig::default()).unwrap();
+        assert_eq!(report.output, dir.path().join("c.epub"));
+        assert_eq!(std::fs::read_to_string(&md).unwrap(), "# C\n");
+    }
+
+    #[test]
+    fn user_config_output_location_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let md = sub.join("d.md");
+        std::fs::write(&md, "# D\n").unwrap();
+        let user =
+            UserConfig::from_toml_str("output-location = \"input\"\n", Path::new(".")).unwrap();
+        let cli =
+            <Cli as clap::Parser>::try_parse_from(["md2epub", md.to_str().unwrap(), "--offline"])
+                .unwrap();
+        let report = run_on_this_thread(&cli, &user).unwrap();
+        assert_eq!(report.output, sub.join("d.epub"));
+        assert!(report.output.is_file());
     }
 
     #[test]

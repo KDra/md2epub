@@ -70,6 +70,16 @@ pub enum Margin {
     Extra,
 }
 
+/// Where the EPUB goes when no output path is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputLocation {
+    /// `<first-input-stem>.epub` in the current directory.
+    #[default]
+    Cwd,
+    /// `<first-input-stem>.epub` beside the first input file.
+    Input,
+}
+
 macro_rules! str_enum {
     ($ty:ident, $what:literal, { $($variant:ident => [$($name:literal),+]),+ $(,)? }) => {
         impl $ty {
@@ -142,6 +152,11 @@ str_enum!(Margin, "margin preset", {
     Normal => ["normal"],
     Wide => ["wide"],
     Extra => ["extra"],
+});
+
+str_enum!(OutputLocation, "output location", {
+    Cwd => ["cwd", "current", "current-dir", "."],
+    Input => ["input", "beside-input", "source"],
 });
 
 /// Parses a `--split-level` value: `1`, `2` or `none`.
@@ -232,8 +247,11 @@ pub struct Options {
     /// User stylesheet appended after the built-in CSS.
     pub extra_css: Option<PathBuf>,
     pub verbose: bool,
-    /// Output path. `None` means "first input's stem + `.epub`" in the CWD.
+    /// Output path as given (`-o` or `book.toml`). `None` means "first
+    /// input's stem + `.epub`" in the place `output_location` names.
     pub output: Option<PathBuf>,
+    /// Where the EPUB goes when `output` is `None`.
+    pub output_location: OutputLocation,
     /// Whether `meta.lang` was given explicitly (flag, `book.toml` or front
     /// matter). When it was not, the `<html lang>` of the first HTML input
     /// may set the book language.
@@ -263,6 +281,7 @@ impl Default for Options {
             extra_css: None,
             verbose: false,
             output: None,
+            output_location: OutputLocation::Cwd,
             lang_given: false,
         }
     }

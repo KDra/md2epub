@@ -39,11 +39,27 @@ fn fixture(name: &str) -> String {
 }
 
 /// Runs the binary with `args` and returns its output, whatever the status.
+/// The user config points at a file that never exists, so the developer's
+/// own defaults never leak into (or get changed by) the tests.
 fn run_raw(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_md2epub"))
-        .args(args)
-        .output()
-        .expect("failed to start md2epub")
+    let no_config = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("md2epub-no-user-config")
+        .join("config.toml");
+    run_with_config(args, &no_config, None)
+}
+
+/// Runs the binary with `args`, the user config at `config`, and the
+/// working directory `cwd` (default: inherited).
+fn run_with_config(args: &[&str], config: &Path, cwd: Option<&Path>) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_md2epub"));
+    cmd.args(args)
+        .env("MD2EPUB_CONFIG", config)
+        .env_remove("VISUAL")
+        .env_remove("EDITOR");
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.output().expect("failed to start md2epub")
 }
 
 /// Result of a successful conversion.
@@ -1133,8 +1149,21 @@ fn output_path_cannot_overwrite_the_input() {
     let md = dir.path().join("a2.md");
     std::fs::write(&md, "# Keep me\n").unwrap();
     let md_s = md.to_str().unwrap();
-    assert_fails(&[md_s, "-o", md_s], "same as the input");
+    // `-o a2.md` gets `.epub` appended, so the input is never the target.
+    let out = run_raw(&[md_s, "--offline", "-o", md_s]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.path().join("a2.md.epub").is_file());
     assert_eq!(std::fs::read_to_string(&md).unwrap(), "# Keep me\n");
+    // The guard still protects the other sources.
+    let css = dir.path().join("style.epub");
+    std::fs::write(&css, "p { color: black }").unwrap();
+    let css_s = css.to_str().unwrap();
+    assert_fails(&[md_s, "--css", css_s, "-o", css_s], "same as the CSS file");
+    assert_eq!(std::fs::read_to_string(&css).unwrap(), "p { color: black }");
 }
 
 #[test]
@@ -1292,4 +1321,268 @@ fn build_after_an_input_is_the_subcommand() {
         epub.text("OEBPS/content.opf")
             .contains("<dc:title>B</dc:title>")
     );
+}
+
+// ---------------------------------------------------------------------------
+// User config (`md2epub config`), output paths, --help defaults
+// ---------------------------------------------------------------------------
+
+fn stdout_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn stderr_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Runs `md2epub config ...` against `config`, asserting success.
+fn config_ok(config: &Path, args: &[&str]) -> String {
+    let mut all = vec!["config"];
+    all.extend_from_slice(args);
+    let out = run_with_config(&all, config, None);
+    assert!(out.status.success(), "{all:?}: {}", stderr_of(&out));
+    stdout_of(&out)
+}
+
+#[test]
+fn config_subcommand_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("cfg").join("config.toml");
+    assert_eq!(
+        config_ok(&config, &["path"]).trim_end(),
+        config.to_str().unwrap()
+    );
+    let list = config_ok(&config, &[]);
+    assert!(list.contains("not created yet"), "{list}");
+    assert!(
+        list.contains("profile") && list.contains("generic"),
+        "{list}"
+    );
+
+    config_ok(&config, &["set", "profile", "scribe"]);
+    config_ok(
+        &config,
+        &["set", "author", "Config Author", "Second Author"],
+    );
+    config_ok(&config, &["set", "notes", "end"]);
+    assert!(config.is_file());
+    assert_eq!(config_ok(&config, &["get", "profile"]).trim_end(), "scribe");
+    assert_eq!(config_ok(&config, &["get", "svg"]).trim_end(), "rasterize");
+    let list = config_ok(&config, &["list"]);
+    assert!(list.contains("user config"), "{list}");
+    assert!(list.contains("built-in (profile scribe)"), "{list}");
+
+    // --help shows the configured defaults (plain text: stdout is a pipe).
+    let help = stdout_of(&run_with_config(&["--help"], &config, None));
+    assert!(help.contains("generic [default: scribe]"), "{help}");
+    assert!(
+        help.contains("rasterize, keep [default: rasterize]"),
+        "{help}"
+    );
+    assert!(
+        help.contains("[default: Config Author, Second Author]"),
+        "{help}"
+    );
+    assert!(
+        !help.contains('\x1b'),
+        "escape codes in piped help:\n{help}"
+    );
+
+    // A conversion picks the defaults up; flags still win.
+    let out = dir.path().join("u.epub");
+    let res = run_with_config(
+        &[
+            &fixture("page.html"),
+            "--offline",
+            "--notes",
+            "none",
+            "-o",
+            out.to_str().unwrap(),
+        ],
+        &config,
+        None,
+    );
+    assert!(res.status.success(), "{}", stderr_of(&res));
+    let epub = Epub::open(&out);
+    assert_valid(&epub);
+    assert_device_safe(&epub, "user config scribe");
+    let opf = epub.text("OEBPS/content.opf");
+    assert!(opf.contains(">Config Author</dc:creator>"), "{opf}");
+    assert!(opf.contains(">Second Author</dc:creator>"), "{opf}");
+    assert!(
+        !epub.chapter_docs().iter().any(|d| epub.is_note_page(d)),
+        "--notes none must beat the user config"
+    );
+
+    let msg = config_ok(&config, &["unset", "profile"]);
+    assert!(msg.contains("removed profile"), "{msg}");
+    assert_eq!(
+        config_ok(&config, &["get", "profile"]).trim_end(),
+        "generic"
+    );
+    let msg = config_ok(&config, &["reset"]);
+    assert!(msg.contains("removed") && msg.contains("author"), "{msg}");
+    assert!(!config.exists());
+}
+
+#[test]
+fn config_errors_are_clean() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config.toml");
+    let fails = |args: &[&str], needle: &str| {
+        let out = run_with_config(args, &config, None);
+        let stderr = stderr_of(&out);
+        assert!(!out.status.success(), "{args:?} should fail");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert!(
+            stderr.contains(needle),
+            "{args:?}: expected {needle:?} in {stderr}"
+        );
+    };
+    fails(&["config", "set", "colour", "red"], "unknown key");
+    fails(&["config", "set", "title", "x"], "single book");
+    fails(&["config", "set", "math", "katex"], "math mode");
+    fails(&["config", "set", "notes-pages", "lots"], "whole number");
+    fails(&["config", "get", "nope"], "unknown key");
+    fails(
+        &["config", "list", "--profile", "scribe"],
+        "takes no input files",
+    );
+    fails(&[&fixture("page.html"), "config"], "takes no input files");
+    assert!(!config.exists());
+
+    // A broken file: conversions fail naming the file and the key, but
+    // path, reset and --help still work.
+    std::fs::write(&config, "profile = \"scribe\"\nmargin = \"huge\"\n").unwrap();
+    let out = dir.path().join("x.epub");
+    let convert_args = [
+        fixture("page.html"),
+        "--offline".into(),
+        "-o".into(),
+        out.to_string_lossy().into_owned(),
+    ];
+    let convert_args: Vec<&str> = convert_args.iter().map(String::as_str).collect();
+    fails(&convert_args, "config.toml");
+    fails(&convert_args, "`margin`");
+    assert!(!out.exists());
+    fails(&["config", "list"], "`margin`");
+    let help = run_with_config(&["--help"], &config, None);
+    assert!(help.status.success());
+    assert!(stdout_of(&help).contains("[default: generic]"));
+    assert!(config_ok(&config, &["path"]).contains("config.toml"));
+    std::fs::write(&config, "this is [not toml").unwrap();
+    fails(&["config", "set", "profile", "scribe"], "not valid TOML");
+    let msg = config_ok(&config, &["reset"]);
+    assert!(msg.contains("removed"), "{msg}");
+    assert!(!config.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn config_edit_runs_the_editor_and_validates() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("sub").join("config.toml");
+    let editor = |name: &str, line: &str| {
+        let script = dir.path().join(name);
+        std::fs::write(&script, format!("#!/bin/sh\necho '{line}' >> \"$1\"\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    };
+    let good = editor("good.sh", "margin = \"wide\"");
+    let bad = editor("bad.sh", "notes = \"sometimes\"");
+    let edit = |visual: &str| {
+        Command::new(env!("CARGO_BIN_EXE_md2epub"))
+            .args(["config", "edit"])
+            .env("MD2EPUB_CONFIG", &config)
+            .env("VISUAL", visual)
+            .output()
+            .unwrap()
+    };
+    let out = edit(good.to_str().unwrap());
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("valid"), "{}", stdout_of(&out));
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.starts_with("# md2epub user defaults."), "{text}");
+    assert_eq!(config_ok(&config, &["get", "margin"]).trim_end(), "wide");
+    let out = edit(bad.to_str().unwrap());
+    assert!(!out.status.success());
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("`notes`") && stderr.contains("config.toml"),
+        "{stderr}"
+    );
+    // A failing editor is reported.
+    let out = edit("false");
+    assert!(!out.status.success());
+    assert!(stderr_of(&out).contains("editor"), "{}", stderr_of(&out));
+}
+
+#[test]
+fn output_path_rules() {
+    let dir = TempDir::new().unwrap();
+    let d = dir.path();
+    std::fs::create_dir(d.join("src")).unwrap();
+    let md = d.join("src").join("notes.md");
+    std::fs::write(&md, "# Notes\n\nText.\n").unwrap();
+    let md = md.to_str().unwrap();
+    let no_config = d.join("none.toml");
+    let ok = |args: &[&str]| {
+        let out = run_with_config(args, &no_config, Some(d));
+        let stderr = stderr_of(&out);
+        assert!(out.status.success(), "{args:?}: {stderr}");
+        stderr
+    };
+    // No extension: .epub is added.
+    ok(&[md, "-o", "book"]);
+    assert!(d.join("book.epub").is_file());
+    // Another extension: .epub is appended, with a note.
+    let stderr = ok(&[md, "-o", "out.txt"]);
+    assert!(d.join("out.txt.epub").is_file());
+    assert!(
+        stderr.contains("note:") && stderr.contains("out.txt.epub"),
+        "{stderr}"
+    );
+    // A trailing separator creates the directory.
+    ok(&[md, "-o", "made/"]);
+    let made = d.join("made").join("notes.epub");
+    assert!(made.is_file());
+    // An existing directory.
+    std::fs::remove_file(&made).unwrap();
+    ok(&[md, "-o", "made"]);
+    assert!(made.is_file());
+    // No -o: the current directory by default ...
+    ok(&[md]);
+    assert!(d.join("notes.epub").is_file());
+    // ... or beside the input.
+    ok(&[md, "--output-location", "input"]);
+    let beside = d.join("src").join("notes.epub");
+    assert!(beside.is_file());
+    std::fs::remove_file(&beside).unwrap();
+    // ... also when the user config says so.
+    let config = d.join("cfg.toml");
+    std::fs::write(&config, "output-location = \"input\"\n").unwrap();
+    let out = run_with_config(&[md], &config, Some(d));
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_valid(&Epub::open(&beside));
+}
+
+#[test]
+fn input_named_config_needs_a_path_prefix() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("config"), "# not markdown by name\n").unwrap();
+    let no_config = dir.path().join("none.toml");
+    // `./config` is an input file (refused for its missing extension), not
+    // the subcommand.
+    let out = run_with_config(&["./config"], &no_config, Some(dir.path()));
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("unsupported input"),
+        "{}",
+        stderr_of(&out)
+    );
+    // `config` alone is the subcommand.
+    let out = run_with_config(&["config", "path"], &no_config, Some(dir.path()));
+    assert!(out.status.success());
+    assert!(stdout_of(&out).contains("none.toml"));
 }

@@ -1,14 +1,20 @@
 //! Option resolution (owned by T1).
 //!
-//! Contract: [`resolve`] merges, in order of precedence,
+//! Contract: [`resolve_with`] merges, in order of precedence,
 //! command-line flags > `book.toml` (for `md2epub build book.toml`) >
 //! YAML front matter of the first input (`title`, `author`/`authors`, `lang`,
-//! `date`, `cover`) > profile defaults, and returns the options plus the
-//! input files in book order.
+//! `date`, `cover`) > the user config ([`UserConfig`], edited with
+//! `md2epub config`) > profile defaults, and returns the options plus the
+//! input files in book order. [`resolve`] is the same without a user config.
+//!
+//! The user config may set `profile`, so the profile-derived defaults (`svg`,
+//! `math`) follow the profile it names unless a higher layer sets them.
 //!
 //! - Paths from `book.toml` (inputs, cover, css, output) are relative to the
 //!   TOML file's directory; paths from front matter are relative to the
-//!   first input's directory; flag paths are relative to the CWD.
+//!   first input's directory; flag paths are relative to the CWD; the user
+//!   config's `css` is relative to the config file's directory (a leading
+//!   `~/` is the home directory).
 //! - `opts.svg` and `opts.math` default to the profile's values.
 //! - `opts.meta.title` stays empty when nothing provides a title; the
 //!   pipeline then falls back to the first `<h1>`, then the file stem.
@@ -45,6 +51,7 @@
 //! css = "extra.css"
 //! offline = true
 //! verbose = false
+//! output-location = "cwd"           # or "input"; used when there is no output
 //! ```
 //!
 //! Unknown keys are an error so that typos do not go unnoticed. As a
@@ -72,7 +79,8 @@ use serde_yaml::Value as Yaml;
 
 use crate::cli::{Cli, Command, Flags};
 use crate::model::{
-    Margin, MathMode, Metadata, NotesPlacement, NotesStyle, Options, SvgMode, parse_split_level,
+    Margin, MathMode, Metadata, NotesPlacement, NotesStyle, Options, OutputLocation, SvgMode,
+    parse_split_level,
 };
 use crate::pipeline::InputKind;
 use crate::profile;
@@ -104,18 +112,152 @@ const TOML_KEYS: &[&str] = &[
     "css",
     "offline",
     "verbose",
+    "output-location",
 ];
+
+/// Keys accepted in the user config, in `md2epub config list` order.
+pub const USER_KEYS: &[&str] = &[
+    "profile",
+    "author",
+    "lang",
+    "split-level",
+    "notes",
+    "notes-style",
+    "notes-pages",
+    "margin",
+    "line-spacing",
+    "math",
+    "svg",
+    "grayscale",
+    "offline",
+    "verbose",
+    "css",
+    "output-location",
+    "follow-links",
+];
+
+/// `book.toml` keys that describe one book and so make no sense as user
+/// defaults.
+const PER_BOOK_KEYS: &[&str] = &[
+    "title",
+    "identifier",
+    "date",
+    "cover",
+    "inputs",
+    "input",
+    "output",
+];
+
+/// Which file a TOML table comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TomlSource {
+    Book,
+    User,
+}
+
+/// Canonical spelling of a TOML key: trimmed, lowercase, `_` as `-`, and
+/// the aliases `authors`/`language` folded into `author`/`lang`.
+pub fn canonical_key(raw: &str) -> String {
+    let key = raw.trim().to_ascii_lowercase().replace('_', "-");
+    match key.as_str() {
+        "authors" => "author".into(),
+        "language" => "lang".into(),
+        _ => key,
+    }
+}
+
+/// User defaults read from the user config file (see `md2epub config`).
+/// `Default` is "no user config".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UserConfig {
+    layer: Layer,
+    /// Canonical keys present in the file, in file order.
+    keys: Vec<String>,
+}
+
+impl UserConfig {
+    /// Parses user config text. Relative paths are joined onto `base` (the
+    /// config file's directory). Unknown and per-book keys are errors.
+    pub fn from_toml_str(text: &str, base: &Path) -> Result<UserConfig> {
+        let table: toml::Table = toml::from_str(text).map_err(|e| anyhow!("invalid TOML: {e}"))?;
+        let layer = Layer::from_table(&table, base, TomlSource::User)?;
+        let mut keys: Vec<String> = Vec::new();
+        for k in table.keys() {
+            let k = canonical_key(k);
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        Ok(UserConfig { layer, keys })
+    }
+
+    /// Reads the user config at `path`; a missing file is an empty config.
+    /// Errors name the file and the offending key.
+    pub fn load(path: &Path) -> Result<UserConfig> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(UserConfig::default());
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading user config {}", path.display()));
+            }
+        };
+        UserConfig::from_toml_str(&text, &parent_dir(path)).with_context(|| {
+            format!(
+                "in user config {} (fix it with `md2epub config edit`, or remove it with `md2epub config reset`)",
+                path.display()
+            )
+        })
+    }
+
+    /// Whether the file sets `key` (canonical spelling, see [`USER_KEYS`]).
+    pub fn is_set(&self, key: &str) -> bool {
+        self.keys.iter().any(|k| k == key)
+    }
+
+    /// Canonical keys the file sets, in file order.
+    pub fn keys(&self) -> &[String] {
+        &self.keys
+    }
+
+    /// The `follow-links` setting, if the file sets it.
+    pub fn follow_links(&self) -> Option<bool> {
+        self.layer.follow_links
+    }
+}
+
+/// The options a conversion starts from before flags, `book.toml` and
+/// front matter apply: the built-in defaults overridden by the user config,
+/// including the defaults of the profile it names.
+pub fn defaults(user: &UserConfig) -> Result<Options> {
+    user.layer.clone().into_options()
+}
 
 /// Upper bound for `notes-pages`, to catch typos such as `notes-pages = 1000`.
 const MAX_NOTES_PAGES: u32 = 100;
 
-/// Resolves the final options and input list. See the module docs.
+/// Resolves the final options and input list without a user config. See
+/// the module docs.
 pub fn resolve(cli: &Cli, front_matter: Option<&str>) -> Result<(Options, Vec<PathBuf>)> {
+    resolve_with(cli, front_matter, &UserConfig::default())
+}
+
+/// Resolves the final options and input list, with `user` as the layer
+/// between front matter and the profile defaults. See the module docs.
+pub fn resolve_with(
+    cli: &Cli,
+    front_matter: Option<&str>,
+    user: &UserConfig,
+) -> Result<(Options, Vec<PathBuf>)> {
     let mut flags = Layer::from_flags(&cli.flags)?;
 
     let shortcut = cli.command.is_none() && is_toml_shortcut(&cli.inputs);
     let toml_path = match &cli.command {
         Some(Command::Build { config }) => Some(config.clone()),
+        Some(Command::Config { .. }) => {
+            bail!("`md2epub config` manages user defaults and converts nothing")
+        }
         None if shortcut => Some(cli.inputs[0].clone()),
         None => None,
     };
@@ -140,6 +282,7 @@ pub fn resolve(cli: &Cli, front_matter: Option<&str>) -> Result<(Options, Vec<Pa
             .with_context(|| format!("front matter of {}", inputs[0].display()))?;
         merged = merged.over(fm_layer);
     }
+    merged = merged.over(user.layer.clone());
 
     let opts = merged.into_options()?;
     Ok((opts, inputs))
@@ -163,7 +306,7 @@ fn check_inputs(inputs: &[PathBuf], toml: Option<&Path>) -> Result<()> {
                 t.display()
             ),
             None => bail!(
-                "no input files given (usage: md2epub <inputs...> -o book.epub, or md2epub build book.toml)"
+                "no input files given (usage: md2epub <inputs...> -o book.epub, md2epub build book.toml, or md2epub config)"
             ),
         }
     }
@@ -178,6 +321,11 @@ fn check_inputs(inputs: &[PathBuf], toml: Option<&Path>) -> Result<()> {
             if input.as_os_str() == "build" {
                 bail!(
                     "input file not found: build (to build from a book file, run `md2epub build <book.toml>`)"
+                );
+            }
+            if input.as_os_str() == "config" {
+                bail!(
+                    "input file not found: config (to change your defaults, run `md2epub config`)"
                 );
             }
             bail!("input file not found: {}", input.display());
@@ -264,6 +412,9 @@ struct Layer {
     css: Option<PathBuf>,
     offline: Option<bool>,
     verbose: Option<bool>,
+    output_location: Option<OutputLocation>,
+    /// Read from the user config; `Options` has no matching field yet.
+    follow_links: Option<bool>,
 }
 
 impl Layer {
@@ -304,6 +455,8 @@ impl Layer {
             css: f.css.clone(),
             offline: switch(f.offline, f.no_offline),
             verbose: switch(f.verbose, f.no_verbose),
+            output_location: f.output_location,
+            follow_links: None,
         })
     }
 
@@ -324,10 +477,38 @@ impl Layer {
     /// Parses `book.toml` text; relative paths are joined onto `base`.
     fn from_toml_str(text: &str, base: &Path) -> Result<Layer> {
         let table: toml::Table = toml::from_str(text).map_err(|e| anyhow!("invalid TOML: {e}"))?;
+        Layer::from_table(&table, base, TomlSource::Book)
+    }
+
+    /// Reads the keys of a `book.toml` or user config table.
+    fn from_table(table: &toml::Table, base: &Path, source: TomlSource) -> Result<Layer> {
         let mut l = Layer::default();
-        for (raw_key, value) in &table {
+        for (raw_key, value) in table {
             let key = raw_key.trim().to_ascii_lowercase().replace('_', "-");
             let ctx = || format!("key `{raw_key}`");
+            if source == TomlSource::User {
+                if PER_BOOK_KEYS.contains(&key.as_str()) {
+                    bail!(
+                        "key `{raw_key}` cannot be a user default because it describes a single book; \
+                         give it on the command line or in book.toml"
+                    );
+                }
+                if !USER_KEYS.contains(&canonical_key(&key).as_str()) {
+                    bail!(
+                        "unknown key `{raw_key}`: expected one of {}",
+                        USER_KEYS.join(", ")
+                    );
+                }
+            }
+            let path_of = |s: String| -> PathBuf {
+                if source == TomlSource::User
+                    && let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\"))
+                    && let Some(home) = dirs::home_dir()
+                {
+                    return home.join(rest);
+                }
+                rel_to(base, &s)
+            };
             match key.as_str() {
                 "title" => l.title = Some(toml_string(value).with_context(ctx)?),
                 "author" | "authors" => {
@@ -343,7 +524,7 @@ impl Layer {
                 }
                 "output" => l.output = Some(rel_to(base, &toml_string(value).with_context(ctx)?)),
                 "cover" => l.cover = Some(rel_to(base, &toml_string(value).with_context(ctx)?)),
-                "css" => l.css = Some(rel_to(base, &toml_string(value).with_context(ctx)?)),
+                "css" => l.css = Some(path_of(toml_string(value).with_context(ctx)?)),
                 "profile" => {
                     let name = toml_string(value).with_context(ctx)?;
                     profile::by_name(&name).with_context(ctx)?;
@@ -387,10 +568,26 @@ impl Layer {
                 "grayscale" => l.grayscale = Some(toml_bool(value).with_context(ctx)?),
                 "offline" => l.offline = Some(toml_bool(value).with_context(ctx)?),
                 "verbose" => l.verbose = Some(toml_bool(value).with_context(ctx)?),
+                "output-location" => l.output_location = Some(toml_parse(value).with_context(ctx)?),
+                "follow-links" if source == TomlSource::User => {
+                    l.follow_links = Some(toml_bool(value).with_context(ctx)?)
+                }
                 _ => bail!(
                     "unknown key `{raw_key}`: expected one of {}",
                     TOML_KEYS.join(", ")
                 ),
+            }
+            // A bad language in book.toml is fixed with a warning at
+            // conversion time; a user default should simply be right.
+            if source == TomlSource::User
+                && matches!(key.as_str(), "lang" | "language")
+                && let Some(lang) = &l.lang
+                && normalize_lang(lang).is_none()
+            {
+                return Err(anyhow!(
+                    "invalid language tag '{lang}': expected a BCP 47 tag such as en, de or pt-BR"
+                ))
+                .with_context(ctx);
             }
         }
         Ok(l)
@@ -456,6 +653,8 @@ impl Layer {
             css: self.css.or(lower.css),
             offline: self.offline.or(lower.offline),
             verbose: self.verbose.or(lower.verbose),
+            output_location: self.output_location.or(lower.output_location),
+            follow_links: self.follow_links.or(lower.follow_links),
         }
     }
 
@@ -494,6 +693,7 @@ impl Layer {
             extra_css: self.css,
             verbose: self.verbose.unwrap_or(d.verbose),
             output: self.output,
+            output_location: self.output_location.unwrap_or(d.output_location),
             lang_given,
         })
     }
@@ -1436,5 +1636,118 @@ mod tests {
         assert!(finalize(&mut o).is_empty());
         let (mut o, _) = resolve(&cli(&[&md, "--svg", "keep", "--math", "mathml"]), None).unwrap();
         assert!(finalize(&mut o).is_empty());
+    }
+
+    // ---- user config --------------------------------------------------------
+
+    fn user(text: &str) -> UserConfig {
+        UserConfig::from_toml_str(text, Path::new("/cfg")).unwrap()
+    }
+
+    #[test]
+    fn user_config_sits_below_front_matter_toml_and_flags() {
+        let u = user(
+            "profile = \"scribe\"\nauthor = \"User\"\nlang = \"de\"\nnotes = \"end\"\nmargin = \"wide\"\ngrayscale = true\noutput-location = \"input\"\n",
+        );
+        let md = path_str(&fixture("kitchen-sink.md"));
+        // Alone, the user config replaces the built-in defaults, and the
+        // profile it names drives the profile defaults.
+        let (o, _) = resolve_with(&cli(&[&md]), None, &u).unwrap();
+        assert_eq!(o.profile.name, "scribe");
+        assert_eq!(o.svg, SvgMode::Rasterize);
+        assert_eq!(o.meta.authors, vec!["User"]);
+        assert_eq!(o.meta.lang, "de");
+        assert!(o.lang_given);
+        assert_eq!(o.notes, NotesPlacement::End);
+        assert_eq!(o.margin, Margin::Wide);
+        assert!(o.grayscale);
+        assert_eq!(o.output_location, OutputLocation::Input);
+        // Front matter beats the user config.
+        let (o, _) = resolve_with(&cli(&[&md]), Some(FM), &u).unwrap();
+        assert_eq!(o.meta.authors, vec!["FM Author"]);
+        assert_eq!(o.meta.lang, "fr");
+        assert_eq!(o.notes, NotesPlacement::End);
+        // book.toml beats the user config.
+        let (_dir, book) =
+            book_dir("inputs = [\"a.md\"]\nprofile = \"generic\"\nmargin = \"extra\"\n");
+        let (o, _) = resolve_with(&cli(&["build", &path_str(&book)]), None, &u).unwrap();
+        assert_eq!(o.profile.name, "generic");
+        assert_eq!(
+            o.svg,
+            SvgMode::Keep,
+            "profile defaults follow the winning profile"
+        );
+        assert_eq!(o.margin, Margin::Extra);
+        assert_eq!(o.notes, NotesPlacement::End);
+        // Flags beat everything.
+        let (o, _) = resolve_with(
+            &cli(&[
+                &md,
+                "--profile",
+                "remarkable",
+                "--no-grayscale",
+                "--output-location",
+                "cwd",
+                "--author",
+                "Flag",
+            ]),
+            Some(FM),
+            &u,
+        )
+        .unwrap();
+        assert_eq!(o.profile.name, "remarkable");
+        assert!(!o.grayscale);
+        assert_eq!(o.output_location, OutputLocation::Cwd);
+        assert_eq!(o.meta.authors, vec!["Flag"]);
+    }
+
+    #[test]
+    fn user_config_explicit_svg_survives_profile_change() {
+        let u = user("profile = \"scribe\"\nsvg = \"keep\"\nmath = \"off\"\n");
+        let md = path_str(&fixture("kitchen-sink.md"));
+        let (o, _) = resolve_with(&cli(&[&md, "--profile", "generic"]), None, &u).unwrap();
+        assert_eq!(o.svg, SvgMode::Keep);
+        assert_eq!(o.math, MathMode::Off);
+        let d = defaults(&u).unwrap();
+        assert_eq!((d.profile.name.as_str(), d.svg), ("scribe", SvgMode::Keep));
+    }
+
+    #[test]
+    fn user_config_rejects_bad_keys_and_values() {
+        for (text, needle) in [
+            ("title = \"x\"", "single book"),
+            ("output = \"x.epub\"", "single book"),
+            ("inputs = [\"a.md\"]", "single book"),
+            ("cover = \"c.png\"", "single book"),
+            ("colour = \"red\"", "unknown key `colour`"),
+            ("math = \"katex\"", "key `math`"),
+            ("notes-pages = -1", "key `notes-pages`"),
+            ("lang = \"not a tag!\"", "key `lang`"),
+            ("follow-links = \"maybe\"", "key `follow-links`"),
+            ("profile = [", "invalid TOML"),
+        ] {
+            let err = format!(
+                "{:#}",
+                UserConfig::from_toml_str(text, Path::new(".")).unwrap_err()
+            );
+            assert!(err.contains(needle), "{text}: {err}");
+        }
+        // book.toml takes output-location but not follow-links (yet).
+        assert!(Layer::from_toml_str("output-location = \"input\"", Path::new(".")).is_ok());
+        let u = user("follow_links = false\nAuthors = [\"A\", \"B\"]\n");
+        assert_eq!(u.follow_links(), Some(false));
+        assert!(u.is_set("author") && u.is_set("follow-links"));
+    }
+
+    #[test]
+    fn missing_user_config_is_empty_and_errors_name_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert_eq!(UserConfig::load(&path).unwrap(), UserConfig::default());
+        fs::write(&path, "margin = \"huge\"\n").unwrap();
+        let err = format!("{:#}", UserConfig::load(&path).unwrap_err());
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("`margin`"), "{err}");
+        assert!(err.contains("md2epub config"), "{err}");
     }
 }
