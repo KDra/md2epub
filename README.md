@@ -60,8 +60,21 @@ md2epub paper.md --profile remarkable --notes after-chapter --notes-style lined 
 md2epub build book.toml
 ```
 
-If you leave out `-o`, the book is written to `<first-input-stem>.epub` in the current
-directory. Warnings, such as a missing image or a remote image skipped offline, are
+Where the book goes (`name` is the first input's file name without its extension):
+
+| You give | The EPUB is written to |
+|---|---|
+| no `-o` | `name.epub` in the current directory, or beside the first input with `--output-location input` (or `md2epub config set output-location input`) |
+| `-o book.epub` | `book.epub` (any `.epub` spelling is kept as is) |
+| `-o book` | `book.epub`: `.epub` is added |
+| `-o notes.txt` | `notes.txt.epub`: `.epub` is appended rather than replacing your extension, and a `note:` line says so |
+| `-o some/dir` (an existing directory) or `-o new/dir/` (ending in `/`) | `some/dir/name.epub`; a missing directory is created |
+
+For `md2epub build book.toml`, an `output` key is relative to the TOML file and follows
+the same rules; without one, the rules for "no `-o`" apply. md2epub never overwrites an
+input file, the `--css` file or the cover image.
+
+Warnings, such as a missing image or a remote image skipped offline, are
 printed to stderr, and the book is still written. md2epub exits with a non-zero
 status only for fatal problems, such as a missing input file, a missing `--cover` or
 `--css` file, a bad option, or an `-o` path that would overwrite an input. In that
@@ -75,7 +88,8 @@ self-closed `<div/>`).
 
 | Option | Values | Default | Meaning |
 |---|---|---|---|
-| `-o, --output <FILE>` | path | `<stem>.epub` | Output EPUB. |
+| `-o, --output <FILE>` | path or directory | `<stem>.epub` | Output EPUB (see above). |
+| `--output-location <WHERE>` | `cwd`, `input` | `cwd` | Where the EPUB goes without `-o`: the current directory, or beside the first input. |
 | `--profile <NAME>` | `scribe`, `remarkable`, `remarkable-pro`, `generic` | `generic` | Target device (see below). |
 | `--title <TITLE>` | text | front matter, then first `<h1>`, then file name | Book title. |
 | `--author <NAME>` | text, repeatable | front matter | Author(s). |
@@ -95,9 +109,13 @@ self-closed `<div/>`).
 | `-v, --verbose` | flag | off | Print progress and detailed diagnostics. `--no-verbose` turns it off. |
 | `--follow-links` | flag | on | Add linked local files to the book (see below). `--no-follow-links` turns it off. |
 
+The defaults above are the built-in ones. `md2epub --help` shows the defaults that
+actually apply, in bold on a terminal, including your own (see
+[Your defaults](#your-defaults-md2epub-config)).
+
 **Precedence:** command-line flags > `book.toml` > YAML front matter of the first input >
-profile defaults. The `--no-...` forms let a flag switch off a boolean that `book.toml`
-switches on.
+your defaults (`md2epub config`) > profile defaults. The `--no-...` forms let a flag
+switch off a boolean that `book.toml` or your defaults switch on.
 
 Front-matter and `book.toml` dates should be `YYYY`, `YYYY-MM` or `YYYY-MM-DD`;
 `2024/1/5` and unambiguous `DD/MM/YYYY` forms are converted, anything else is left out
@@ -165,6 +183,52 @@ follow-links = true
 ```
 
 Flags given on the command line still win: `md2epub build book.toml --profile remarkable -o rm.epub`.
+`output-location = "input"` is accepted too.
+
+### Your defaults (`md2epub config`)
+
+If you always build for the same device, save your choices once instead of repeating
+the flags:
+
+```sh
+md2epub config set profile scribe
+md2epub config set notes after-chapter
+md2epub config set author "Ada Lovelace" "Charles Babbage"   # one or more names
+md2epub config                     # same as `md2epub config list`
+```
+
+| Command | What it does |
+|---|---|
+| `md2epub config list` | Every setting with its effective default and where it comes from (`built-in`, `built-in (profile scribe)` or `user config`). This is the default action. |
+| `md2epub config get <key>` | Prints one effective default. |
+| `md2epub config set <key> <value>` | Checks the value with the same rules as the flag and saves it. `author` takes one or more names, each as its own argument (names are not split on commas). Comments and other keys in the file are kept. |
+| `md2epub config unset <key>` | Removes the key, so the built-in default applies again. |
+| `md2epub config reset` | Deletes the file without asking, and prints what it set. |
+| `md2epub config path` | Prints the file's location. |
+| `md2epub config edit` | Opens the file in `$VISUAL` or `$EDITOR` (otherwise `vi`, or `notepad` on Windows) and checks it when the editor exits. |
+
+Keys: `profile`, `author`, `lang`, `split-level`, `notes`, `notes-style`, `notes-pages`,
+`margin`, `line-spacing`, `math`, `svg`, `grayscale`, `offline`, `verbose`, `css`,
+`output-location` and `follow-links`. They take the same values as the flags with the same
+names. Booleans accept `true`/`false`, `on`/`off`, `yes`/`no`. Per-book settings
+(`title`, `cover`, `output`, `date`, `identifier`, inputs) cannot be defaults.
+
+The file is TOML, `config.toml` in your configuration directory: `~/.config/md2epub/` on
+Linux, `~/Library/Application Support/md2epub/` on macOS, and `%APPDATA%\md2epub\` on Windows.
+Set the `MD2EPUB_CONFIG` environment variable to use another file. A relative `css`
+path in the file is relative to the file's directory (`config set css` stores an absolute
+path), and `~/` means your home directory.
+
+Your defaults sit just above the profile defaults, so front matter, `book.toml` and
+flags still win. A `profile` you set also changes the profile-derived defaults (`svg`),
+and an `svg` or `math` value you set yourself applies under every profile.
+If the file has a mistake, conversions stop with an error that names the file and the
+key. `md2epub config edit`, `config path` and `config reset` still work, and so does
+`config unset` as long as the file is valid TOML. `--help` then shows the built-in
+defaults.
+
+`config` is a subcommand name, so a file literally named `config` must be written as
+`./config` (the same goes for `build`).
 
 ### Linked local files
 
@@ -186,7 +250,8 @@ Pages for files other than documents are grouped in the table of contents under 
 link, with a warning that says why (the file does not exist, is a directory, is binary or
 is larger than 1 MB). Links to a file that is also an input go to that input's chapter.
 At most 500 linked files are added. Web links, `mailto:` links and links inside the book
-are not affected. Use `--no-follow-links` (or `follow-links = false`) to only convert the
+are not affected. Use `--no-follow-links` (or `follow-links = false` in `book.toml`, or
+`md2epub config set follow-links false` to make it your default) to only convert the
 inputs; links to other local files are then removed, with a warning.
 
 ## Device guide

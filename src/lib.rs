@@ -20,3 +20,4 @@ pub mod pipeline;
 pub mod profile;
 pub mod style;
 pub mod svg;
+pub mod user_config;

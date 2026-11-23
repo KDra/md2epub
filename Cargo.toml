@@ -54,6 +54,9 @@ mermaid-rs-renderer = { version = "0.3.1", default-features = false, optional = 
 # T8
 # T9
 zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
+# User defaults (`md2epub config`): config dir lookup and comment-preserving edits.
+dirs = "7.0.0"
+toml_edit = "0.25.20"
 
 [dev-dependencies]
 # T0
