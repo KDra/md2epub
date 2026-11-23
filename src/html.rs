@@ -2919,9 +2919,15 @@ mod tests {
         std::fs::write(&b, "y").unwrap();
         let a_str = a.to_string_lossy().into_owned();
         let b_str = b.to_string_lossy().into_owned();
+        // A real file URL: file:///tmp/x/b.md on Unix, file:///C:/x/b.md on Windows.
+        let b_url_path = b_str.replace('\\', "/");
+        let b_url = format!(
+            "file://{}{b_url_path}",
+            if b_url_path.starts_with('/') { "" } else { "/" }
+        );
         let mut ctx = ctx_with(None, &a_str);
         let mut chapters = convert(
-            &format!(r#"<p><a href="file://{b_str}#sec">to b</a></p>"#),
+            &format!(r#"<p><a href="{b_url}#sec">to b</a></p>"#),
             &mut ctx,
             &a_str,
         );

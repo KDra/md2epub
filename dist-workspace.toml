@@ -17,3 +17,8 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+
+# Build Windows arm64 natively: the default cross-compile container ships a
+# rustc that is too old for some dependencies (hayro needs >= 1.92).
+[dist.github-custom-runners]
+aarch64-pc-windows-msvc = "windows-11-arm"
