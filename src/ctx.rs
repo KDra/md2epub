@@ -15,6 +15,17 @@ use crate::svg;
 /// Default render scale for rasterized SVGs (2x nominal size, crisp at 300 ppi).
 pub const SVG_RASTER_SCALE: f32 = 2.0;
 
+/// Re-encodes a PNG as 8-bit grayscale (used for `--grayscale`).
+fn to_grayscale_png(png: &[u8]) -> Result<Vec<u8>> {
+    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .context("decoding rasterized SVG")?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.to_luma8()
+        .write_to(&mut out, image::ImageFormat::Png)
+        .context("encoding grayscale PNG")?;
+    Ok(out.into_inner())
+}
+
 /// Shared state for one conversion run.
 #[derive(Debug)]
 pub struct Ctx {
@@ -97,7 +108,12 @@ impl Ctx {
             SvgMode::Rasterize => {
                 let raster = svg::rasterize(svg.as_bytes(), resources_dir, w, h, SVG_RASTER_SCALE)
                     .context("rasterizing SVG")?;
-                let src = self.add_image(raster.png, "png");
+                let png = if self.opts.grayscale {
+                    to_grayscale_png(&raster.png)?
+                } else {
+                    raster.png
+                };
+                let src = self.add_image(png, "png");
                 Ok(ImgRef {
                     src,
                     width_px: ((raster.width as f32 / SVG_RASTER_SCALE).round() as u32).max(1),
@@ -238,6 +254,14 @@ mod tests {
         assert!(r.src.ends_with(".png"));
         assert!(r.width_px >= 1 && r.height_px >= 1);
         assert_eq!(ctx.resources()[1].media_type, "image/png");
+
+        ctx.opts.grayscale = true;
+        let color = r#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4"><rect width="4" height="4" fill="red"/></svg>"#;
+        let r = ctx.add_vector(color).unwrap();
+        let res = ctx.resources().last().unwrap();
+        assert!(r.src.ends_with(".png"));
+        let img = image::load_from_memory(&res.data).unwrap();
+        assert_eq!(img.color(), image::ColorType::L8);
     }
 
     #[test]

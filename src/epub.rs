@@ -849,9 +849,10 @@ fn nav_document(title: &str, lang: &str, toc: &[TocNode], first_chapter: Option<
     } else {
         nav_items(toc, 3, &mut items);
     }
-    let mut landmarks = String::from(
-        "      <li><a epub:type=\"cover\" href=\"text/cover.xhtml\">Cover</a></li>\n      <li><a epub:type=\"toc\" href=\"#toc\">Contents</a></li>\n",
-    );
+    // No `toc` landmark: the nav document is not in the spine, and
+    // epubcheck (RSC-011) rejects links to non-spine documents.
+    let mut landmarks =
+        String::from("      <li><a epub:type=\"cover\" href=\"text/cover.xhtml\">Cover</a></li>\n");
     if let Some(first) = first_chapter {
         let _ = writeln!(
             landmarks,

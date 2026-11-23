@@ -3,7 +3,9 @@ name = "md2epub"
 version = "0.1.0"
 edition = "2024"
 description = "Convert rich Markdown or HTML into reflowable EPUB 3 for handwriting on Kindle Scribe and reMarkable"
-license = "MIT OR Apache-2.0"
+license = "MIT"
+# Used by dist for release download URLs; change it if the GitHub repo lives elsewhere.
+repository = "https://github.com/KDra/md2epub"
 publish = false
 
 [features]
@@ -24,7 +26,6 @@ hex = "0.4.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 # T1
 clap = { version = "4.6.9", features = ["derive"] }
-serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.2.2"
 serde_yaml = "0.9.34"
 # T2
@@ -74,7 +75,18 @@ lto = "thin"
 codegen-units = 1
 strip = true
 
-# Crates for later tasks are declared up front (see TASKS.md); T10 can
-# remove this once every dependency is used.
+# The profile that 'dist' (cargo-dist) builds release artifacts with; see
+# dist-workspace.toml for targets and installers.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# T10: `publish = false` keeps the crate off crates.io; this tells dist the
+# binary is still meant for GitHub Releases.
+[package.metadata.dist]
+dist = true
+
+# `mitex-spec-gen` is never named in code: it is a dependency only to turn on
+# its `prebuilt` feature for mitex.
 [lints.cargo]
 unused_dependencies = "allow"
