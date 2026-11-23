@@ -971,15 +971,18 @@ fn ncx_points(nodes: &[TocNode], indent: usize, order: &mut usize, out: &mut Str
 // Documents
 // ---------------------------------------------------------------------------
 
-/// Wraps serialized body content in an EPUB 3 XHTML document.
+/// Wraps serialized body content in an EPUB 3 XHTML document. `<style>`
+/// elements found in the body (the sanitizer keeps an input's own styles at
+/// the start of each chapter) move into `<head>`, where XHTML allows them.
 fn chapter_document(title: &str, lang: &str, body: &str) -> String {
+    let (styles, body) = extract_styles(body);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="{lang}" xml:lang="{lang}">
 <head>
 <title>{title}</title>
 <link rel="stylesheet" type="text/css" href="../css/base.css"/>
-</head>
+{styles}</head>
 <body>
 {body}
 </body>
@@ -988,6 +991,49 @@ fn chapter_document(title: &str, lang: &str, body: &str) -> String {
         lang = escape(lang),
         title = escape(title),
     )
+}
+
+/// Splits serialized XHTML into its `<style>` elements (each on its own
+/// line) and the remaining content. Style text is escaped by the serializer,
+/// so a literal `</style>` can only be the element's end tag.
+fn extract_styles(body: &str) -> (String, String) {
+    let mut styles = String::new();
+    let mut rest = String::with_capacity(body.len());
+    let mut pos = 0;
+    while let Some(off) = find_style_start(&body[pos..]) {
+        let start = pos + off;
+        let after_open = &body[start..];
+        let Some(tag_end) = after_open.find('>') else {
+            break;
+        };
+        let end = if after_open[..tag_end].ends_with('/') {
+            start + tag_end + 1
+        } else {
+            match after_open.find("</style>") {
+                Some(e) => start + e + "</style>".len(),
+                None => break,
+            }
+        };
+        rest.push_str(&body[pos..start]);
+        styles.push_str(&body[start..end]);
+        styles.push('\n');
+        pos = end;
+    }
+    rest.push_str(&body[pos..]);
+    (styles, rest)
+}
+
+/// Offset of the next `<style` start tag (not e.g. `<styles`).
+fn find_style_start(s: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(i) = s[from..].find("<style") {
+        let at = from + i;
+        match s.as_bytes().get(at + "<style".len()) {
+            Some(b'>' | b' ' | b'/' | b'\t' | b'\n' | b'\r') => return Some(at),
+            _ => from = at + 1,
+        }
+    }
+    None
 }
 
 fn cover_document(title: &str, authors: &[String], lang: &str, cover: &Cover<'_>) -> String {
@@ -1792,5 +1838,32 @@ mod tests {
         let (_d, out) = write_book(&book);
         let opf = read(&mut open(&out), "OEBPS/content.opf");
         assert!(!opf.contains("dc:date"));
+    }
+
+    #[test]
+    fn body_styles_move_to_head() {
+        let body = "<style>.a { color: red; }</style>\n<p>x</p><styles-not/><style type=\"text/css\">b &gt; i {}</style><p>y</p>";
+        let doc = chapter_document("T", "en", body);
+        let xml = parse(&doc);
+        let head = xml
+            .root_element()
+            .children()
+            .find(|n| n.has_tag_name("head"))
+            .unwrap();
+        let body_el = xml
+            .root_element()
+            .children()
+            .find(|n| n.has_tag_name("body"))
+            .unwrap();
+        assert_eq!(
+            head.children().filter(|n| n.has_tag_name("style")).count(),
+            2
+        );
+        assert!(!body_el.descendants().any(|n| n.has_tag_name("style")));
+        assert!(doc.contains("<styles-not/>"));
+        assert!(doc.contains("b &gt; i {}"));
+        let (s, rest) = extract_styles("<p>no styles</p><style>unterminated");
+        assert!(s.is_empty());
+        assert_eq!(rest, "<p>no styles</p><style>unterminated");
     }
 }

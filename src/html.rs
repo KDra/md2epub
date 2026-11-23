@@ -1728,7 +1728,10 @@ mod tests {
         assert_eq!(ch[0].headings[1].text, "Later part");
         let all: String = ch.iter().map(|c| c.body_xhtml.as_str()).collect();
         assert!(!all.contains("class=\"anchor\""), "{all}");
-        assert!(all.contains(r##"<a href="#later-part">later</a>"##), "{all}");
+        assert!(
+            all.contains(r##"<a href="#later-part">later</a>"##),
+            "{all}"
+        );
         // The footnote definitions ended up in the last chapter.
         assert!(ch[0].body_xhtml.contains("ch002.xhtml#fn-n"), "{all}");
         assert!(ch[1].body_xhtml.contains("ch001.xhtml#fnref-n"), "{all}");
