@@ -1,0 +1,68 @@
+[package]
+name = "md2epub"
+version = "0.1.0"
+edition = "2024"
+description = "Convert rich Markdown or HTML into reflowable EPUB 3 for handwriting on Kindle Scribe and reMarkable"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+default = ["math", "mermaid"]
+# LaTeX math rendering (T6 adds its optional crates here).
+math = []
+# Mermaid diagram rendering (T7 adds its optional crates here).
+mermaid = []
+
+[dependencies]
+# T0
+anyhow = "1.0.105"
+html5ever = "0.40.1"
+markup5ever_rcdom = "0.40.1"
+sha2 = "0.11.1"
+hex = "0.4.3"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
+# T1
+clap = { version = "4.6.9", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.2"
+serde_yaml = "0.9.34"
+# T2
+comrak = "1.2.0"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+# T3
+# T4
+ureq = { version = "3.5.2", default-features = false, features = ["rustls", "gzip"] }
+# T5
+resvg = "0.50.0"
+usvg = "0.50.0"
+tiny-skia = "0.12.0"
+# T6
+# T7
+# T8
+# T9
+zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+# T0
+tempfile = "3.27.0"
+roxmltree = "0.21.2"
+# T1
+# T2
+# T3
+# T4
+# T5
+# T6
+# T7
+# T8
+# T9
+# T10
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Crates for later tasks are declared up front (see TASKS.md); T10 can
+# remove this once every dependency is used.
+[lints.cargo]
+unused_dependencies = "allow"

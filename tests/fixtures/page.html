@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>A Plain HTML Page</title>
+  <link rel="stylesheet" href="missing.css">
+  <style>
+    .note { font-style: italic; }
+    .hero { background-image: url("images/chart.png"); }
+  </style>
+  <script>alert("removed by the sanitizer");</script>
+</head>
+<body>
+  <h1>A Plain HTML Page</h1>
+  <p class="note" onclick="alert(1)">HTML inputs are sanitized: scripts and
+  event handlers disappear, <a href="javascript:alert(2)">bad links</a> too.</p>
+  <p>Entities&nbsp;like &copy; &mdash; and &hellip; become characters.</p>
+  <figure>
+    <img src="images/chart.png" alt="Chart again">
+    <figcaption>The same chart, deduplicated in the book.</figcaption>
+  </figure>
+  <h2 id="second-section">Second section</h2>
+  <p>Unclosed paragraph
+  <p>Another one with an <img src="images/diagram.svg"> image and a link back
+  to <a href="kitchen-sink.md#tables">the tables</a>.
+  <iframe src="https://example.com"></iframe>
+  <form><input type="text"></form>
+  <h2>Second section</h2>
+  <p>A duplicate heading text gets a unique id.</p>
+</body>
+</html>

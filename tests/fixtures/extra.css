@@ -1,0 +1,3 @@
+/* User stylesheet fixture, appended after the built-in CSS. */
+h1 { text-align: center; }
+.callout { font-size: 0.9em; }

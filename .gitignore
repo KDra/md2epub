@@ -1,0 +1,4 @@
+/target
+*.epub
+!tests/fixtures/**/*.epub
+.DS_Store

@@ -1,0 +1,17 @@
+/* md2epub base stylesheet (T8 owns the final version). */
+body {
+  color: #000;
+  background: #fff;
+}
+img {
+  max-width: 100%;
+  height: auto;
+}
+pre {
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+.notes-page {
+  page-break-before: always;
+  page-break-after: always;
+}

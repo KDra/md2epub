@@ -1,0 +1,20 @@
+# Example book definition: same keys as the command-line flags, plus `inputs`.
+# Paths are relative to this file.
+title = "Fixture Book"
+authors = ["Ada Lovelace", "Charles Babbage"]
+lang = "en"
+inputs = ["kitchen-sink.md", "page.html"]
+output = "fixture-book.epub"
+cover = "photo.jpg"
+profile = "scribe"
+split-level = 2
+notes = "after-chapter"
+notes-style = "lined"
+notes-pages = 1
+margin = "wide"
+line-spacing = 1.5
+math = "image"
+svg = "rasterize"
+grayscale = false
+css = "extra.css"
+offline = true
