@@ -836,12 +836,15 @@ name = "md2epub"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "comrak",
+ "flate2",
  "hex",
  "html5ever",
  "image",
  "markup5ever_rcdom",
+ "percent-encoding",
  "resvg",
  "roxmltree 0.21.2",
  "serde",

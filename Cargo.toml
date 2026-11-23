@@ -32,6 +32,9 @@ syntect = { version = "5.3.0", default-features = false, features = ["default-fa
 # T3
 # T4
 ureq = { version = "3.5.2", default-features = false, features = ["rustls", "gzip"] }
+base64 = "0.23.1"
+percent-encoding = "2.3.2"
+flate2 = "1.1.11"
 # T5
 resvg = "0.50.0"
 usvg = "0.50.0"
