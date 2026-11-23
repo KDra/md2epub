@@ -9,7 +9,7 @@ publish = false
 [features]
 default = ["math", "mermaid"]
 # LaTeX math rendering (T6 adds its optional crates here).
-math = []
+math = ["dep:mitex", "dep:mitex-spec-gen", "dep:typst", "dep:typst-layout", "dep:typst-svg"]
 # Mermaid diagram rendering (T7 adds its optional crates here).
 mermaid = []
 
@@ -37,6 +37,13 @@ resvg = "0.50.0"
 usvg = "0.50.0"
 tiny-skia = "0.12.0"
 # T6
+pulldown-latex = "0.8.0"
+mitex = { version = "0.2.4", optional = true }
+# Use mitex's prebuilt command spec so its build script never shells out.
+mitex-spec-gen = { version = "0.2.4", optional = true, features = ["prebuilt"] }
+typst = { version = "0.15.1", optional = true }
+typst-layout = { version = "0.15.1", optional = true }
+typst-svg = { version = "0.15.1", optional = true }
 # T7
 # T8
 # T9
