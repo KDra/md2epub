@@ -24,8 +24,8 @@ Convert rich Markdown or HTML into a **reflowable EPUB 3** that you can write on
 
 ### Prebuilt binaries
 
-Every tagged release has archives for macOS (Apple Silicon and Intel), Linux (x64 and
-arm64, static musl) and Windows (x64), plus installers:
+Every tagged release has archives for macOS (Apple Silicon), Linux (x64 and arm64,
+static musl) and Windows (x64 and arm64), plus installers:
 
 ```sh
 # macOS / Linux
