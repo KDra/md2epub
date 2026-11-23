@@ -136,7 +136,9 @@ pub fn build_book(
         assets::transform(&doc, &mut ctx)?;
         chapters.extend(html::split(&doc, &mut ctx)?);
     }
-    html::fix_links(&mut chapters);
+    for w in html::fix_links_with_warnings(&mut chapters) {
+        ctx.warn(w);
+    }
     let chapters = notes::insert(chapters, &mut ctx)?;
     let css = style::build_css(&ctx.opts)?;
 
