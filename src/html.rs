@@ -2030,7 +2030,10 @@ pub fn resolve_local_path(base_dir: &Path, root: Option<&Path>, path: &str) -> P
 }
 
 /// Normalized key for comparing input paths: canonical when the file
-/// exists, else lexically cleaned.
+/// exists. For a missing file, the nearest existing ancestor is
+/// canonicalized and the rest appended, so the key compares equal to the
+/// keys of existing siblings (symlinked temp dirs on macOS, `\\?\` prefixes
+/// and 8.3 short names on Windows).
 pub fn source_key(p: &Path) -> PathBuf {
     if let Ok(c) = std::fs::canonicalize(p) {
         return c;
@@ -2042,7 +2045,24 @@ pub fn source_key(p: &Path) -> PathBuf {
             .map(|d| d.join(p))
             .unwrap_or_else(|_| p.to_path_buf())
     };
-    lexical_normalize(&abs)
+    let norm = lexical_normalize(&abs);
+    let mut rest = Vec::new();
+    let mut cur = norm.as_path();
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            rest.push(name.to_os_string());
+        } else {
+            break;
+        }
+        if let Ok(mut c) = std::fs::canonicalize(parent) {
+            for name in rest.iter().rev() {
+                c.push(name);
+            }
+            return c;
+        }
+        cur = parent;
+    }
+    norm
 }
 
 fn lexical_normalize(p: &Path) -> PathBuf {
@@ -3216,6 +3236,21 @@ mod tests {
             warnings.iter().any(|w| w.contains("'data:'")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn missing_file_key_matches_existing_sibling_keys() {
+        // The temp dir path is not canonical on macOS (/var -> /private/var)
+        // or Windows (8.3 names, no \\?\ prefix), like real-world inputs.
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::write(docs.join("guide.md"), "x").unwrap();
+        let existing = source_key(&docs.join("guide.md"));
+        let missing = source_key(&docs.join("guide.html"));
+        assert_eq!(missing.with_extension(""), existing.with_extension(""));
+        let nested = source_key(&docs.join("no/such/../dir/f.md"));
+        assert_eq!(nested, existing.parent().unwrap().join("no/dir/f.md"));
     }
 
     #[test]
