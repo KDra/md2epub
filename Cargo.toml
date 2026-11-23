@@ -8,10 +8,11 @@ publish = false
 
 [features]
 default = ["math", "mermaid"]
-# LaTeX math rendering (T6 adds its optional crates here).
+# LaTeX math rendering: typst-based SVG math (T6). MathML works without it.
 math = ["dep:mitex", "dep:mitex-spec-gen", "dep:typst", "dep:typst-layout", "dep:typst-svg"]
-# Mermaid diagram rendering (T7 adds its optional crates here).
-mermaid = []
+# Mermaid diagram rendering: in-process renderer (T7). Without it, only an
+# `mmdc` found on PATH is used.
+mermaid = ["dep:mermaid-rs-renderer"]
 
 [dependencies]
 # T0
@@ -48,6 +49,7 @@ typst = { version = "0.15.1", optional = true }
 typst-layout = { version = "0.15.1", optional = true }
 typst-svg = { version = "0.15.1", optional = true }
 # T7
+mermaid-rs-renderer = { version = "0.3.1", default-features = false, optional = true }
 # T8
 # T9
 zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
