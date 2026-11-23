@@ -45,6 +45,7 @@
 //! css = "extra.css"
 //! offline = true
 //! verbose = false
+//! follow-links = true               # add linked local files
 //! ```
 //!
 //! Unknown keys are an error so that typos do not go unnoticed. As a
@@ -104,6 +105,7 @@ const TOML_KEYS: &[&str] = &[
     "css",
     "offline",
     "verbose",
+    "follow-links",
 ];
 
 /// Upper bound for `notes-pages`, to catch typos such as `notes-pages = 1000`.
@@ -264,6 +266,8 @@ struct Layer {
     css: Option<PathBuf>,
     offline: Option<bool>,
     verbose: Option<bool>,
+    /// Linked local files (`--follow-links`, `follow-links`).
+    follow_links: Option<bool>,
 }
 
 impl Layer {
@@ -304,6 +308,7 @@ impl Layer {
             css: f.css.clone(),
             offline: switch(f.offline, f.no_offline),
             verbose: switch(f.verbose, f.no_verbose),
+            follow_links: switch(f.follow_links, f.no_follow_links),
         })
     }
 
@@ -387,6 +392,8 @@ impl Layer {
                 "grayscale" => l.grayscale = Some(toml_bool(value).with_context(ctx)?),
                 "offline" => l.offline = Some(toml_bool(value).with_context(ctx)?),
                 "verbose" => l.verbose = Some(toml_bool(value).with_context(ctx)?),
+                // --- Linked local files ---
+                "follow-links" => l.follow_links = Some(toml_bool(value).with_context(ctx)?),
                 _ => bail!(
                     "unknown key `{raw_key}`: expected one of {}",
                     TOML_KEYS.join(", ")
@@ -456,6 +463,7 @@ impl Layer {
             css: self.css.or(lower.css),
             offline: self.offline.or(lower.offline),
             verbose: self.verbose.or(lower.verbose),
+            follow_links: self.follow_links.or(lower.follow_links),
         }
     }
 
@@ -495,6 +503,7 @@ impl Layer {
             verbose: self.verbose.unwrap_or(d.verbose),
             output: self.output,
             lang_given,
+            follow_links: self.follow_links.unwrap_or(d.follow_links),
         })
     }
 }
@@ -1263,6 +1272,24 @@ mod tests {
         assert_eq!(strip_front_matter_delimiters("---\na: 1\n...\n"), "a: 1\n");
         assert_eq!(strip_front_matter_delimiters(""), "");
         assert_eq!(strip_front_matter_delimiters("---"), "");
+    }
+
+    // --- Linked local files ---
+    #[test]
+    fn follow_links_from_toml_and_flags() {
+        let (_dir, plain) = book_dir("inputs = [\"a.md\"]\n");
+        let (o, _) = resolve(&cli(&["build", &path_str(&plain)]), None).unwrap();
+        assert!(o.follow_links, "on by default");
+        let (_dir, book) = book_dir("inputs = [\"a.md\"]\nfollow-links = false\n");
+        let (o, _) = resolve(&cli(&["build", &path_str(&book)]), None).unwrap();
+        assert!(!o.follow_links);
+        let (o, _) = resolve(&cli(&["build", &path_str(&book), "--follow-links"]), None).unwrap();
+        assert!(o.follow_links);
+        let (_dir, on) = book_dir("inputs = [\"a.md\"]\nfollow_links = true\n");
+        let (o, _) = resolve(&cli(&["build", &path_str(&on), "--no-follow-links"]), None).unwrap();
+        assert!(!o.follow_links);
+        let (_dir, bad) = book_dir("inputs = [\"a.md\"]\nfollow-links = \"yes please\"\n");
+        assert!(resolve(&cli(&["build", &path_str(&bad)]), None).is_err());
     }
 
     #[test]

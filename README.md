@@ -16,6 +16,9 @@ Convert rich Markdown or HTML into a **reflowable EPUB 3** that you can write on
   or converted to MathML.
 - Mermaid diagrams (```` ```mermaid ````) are rendered in-process.
 - Syntax-highlighted code that stays readable in grayscale.
+- Local files that your documents link to (other Markdown or HTML files, images,
+  Mermaid sources, code and text files) are added to the book, and the links point
+  to them.
 - Blank, lined, dotted or grid **note pages** after every chapter or at the end of the
   book, plus wide-margin presets that leave room for handwriting.
 - One self-contained binary per OS. You do not need Java, Node, Python or a browser.
@@ -90,6 +93,7 @@ self-closed `<div/>`).
 | `--css <FILE>` | path | none | Extra CSS appended after the built-in stylesheet. Fonts and images it references with `url(...)` (relative to the CSS file) are embedded. |
 | `--offline` | flag | off | Do not download remote images (their alt text is kept). `--no-offline` turns it off. |
 | `-v, --verbose` | flag | off | Print progress and detailed diagnostics. `--no-verbose` turns it off. |
+| `--follow-links` | flag | on | Add linked local files to the book (see below). `--no-follow-links` turns it off. |
 
 **Precedence:** command-line flags > `book.toml` > YAML front matter of the first input >
 profile defaults. The `--no-...` forms let a flag switch off a boolean that `book.toml`
@@ -157,9 +161,33 @@ svg = "rasterize"
 grayscale = false
 css = "extra.css"
 offline = true
+follow-links = true
 ```
 
 Flags given on the command line still win: `md2epub build book.toml --profile remarkable -o rm.epub`.
+
+### Linked local files
+
+Links to local files (`[diagram](docs/flow.svg)`, `<a href="../NOTES.md#setup">`,
+`file:///...`) are followed: each linked file that exists is added to the book once,
+after the inputs, in the order it is first linked (breadth-first), and the link is
+rewritten to point to it. Paths are relative to the linking file; `%20` escapes are
+decoded and `?query` parts are ignored.
+
+| Linked file | Added as |
+|---|---|
+| `.md`, `.markdown`, `.html`, `.htm`, `.xhtml` | Chapters, converted like an input; their own links are followed too, and `#fragment` links land on the right heading. |
+| Images (`.svg`, `.png`, `.jpg`, `.gif`, `.webp`, `.bmp`, `.tif`) | A page with the file name and the image (rasterized under device profiles). |
+| Mermaid (`.mmd`, `.mermaid`) | A page with the rendered diagram (the source as a code block, with a warning, if it cannot be rendered). |
+| Other UTF-8 text files up to 1 MB | A page with the file name and the contents as a code block, highlighted by file extension. |
+
+Pages for files other than documents are grouped in the table of contents under a final
+**Linked files** section. Links to files that cannot be added keep their text but lose the
+link, with a warning that says why (the file does not exist, is a directory, is binary or
+is larger than 1 MB). Links to a file that is also an input go to that input's chapter.
+At most 500 linked files are added. Web links, `mailto:` links and links inside the book
+are not affected. Use `--no-follow-links` (or `follow-links = false`) to only convert the
+inputs; links to other local files are then removed, with a warning.
 
 ## Device guide
 

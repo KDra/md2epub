@@ -370,6 +370,41 @@ fn write_tag(
     output.write_str(&tag)
 }
 
+/// Renders `code` as a standalone code block, highlighted like a fenced
+/// block tagged `lang` (a fence info token such as `rs`, `py` or `toml`):
+/// `<pre class="highlight"><code class="language-x">` when the language is
+/// known, else a plain `<pre><code>`.
+pub fn code_block(code: &str, lang: &str) -> String {
+    let token: String = lang
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '_' | '#'))
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let syntax = (code.len() <= MAX_HIGHLIGHT_BYTES)
+        .then(|| find_syntax(&token))
+        .flatten();
+    let highlighted = syntax.and_then(|syntax| {
+        catch_unwind(AssertUnwindSafe(|| highlight(code, syntax)))
+            .ok()
+            .and_then(Result::ok)
+    });
+    let mut out = String::with_capacity(code.len() * 2 + 64);
+    match highlighted {
+        Some(html) => {
+            out.push_str("<pre class=\"highlight\"><code class=\"language-");
+            out.push_str(&token);
+            out.push_str("\">");
+            out.push_str(&html);
+        }
+        None => {
+            out.push_str("<pre><code>");
+            escape_into(code, false, &mut out);
+        }
+    }
+    out.push_str("</code></pre>\n");
+    out
+}
+
 /// syntect-based highlighter plugged into comrak.
 struct Highlighter;
 
@@ -722,5 +757,22 @@ mod tests {
         assert!(h.contains("<svg"), "{h}");
         assert!(h.contains("<del>strikethrough</del>"), "{h}");
         assert_xhtml_ok(h);
+    }
+
+    #[test]
+    fn standalone_code_blocks() {
+        let h = code_block("fn main() { let x = 1 < 2; }\n", "rs");
+        assert!(
+            h.starts_with("<pre class=\"highlight\"><code class=\"language-rs\">"),
+            "{h}"
+        );
+        assert!(h.contains("<span style="), "{h}");
+        assert_xhtml_ok(&h);
+        let plain = code_block("a < b & c", "txt");
+        assert_eq!(plain, "<pre><code>a &lt; b &amp; c</code></pre>\n");
+        let unknown = code_block("x", "no-such-language\"><script>");
+        assert!(unknown.starts_with("<pre><code>"), "{unknown}");
+        let big = "x\n".repeat(MAX_HIGHLIGHT_BYTES);
+        assert!(code_block(&big, "rs").starts_with("<pre><code>"));
     }
 }

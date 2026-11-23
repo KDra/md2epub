@@ -132,6 +132,23 @@ pub struct Flags {
     /// Quiet output (overrides `verbose = true` in book.toml).
     #[arg(long = "no-verbose", global = true, overrides_with = "verbose")]
     pub no_verbose: bool,
+
+    // --- Linked local files (feature: follow-links) ---
+    /// Add local files that the inputs link to (default).
+    #[arg(
+        long = "follow-links",
+        global = true,
+        overrides_with = "no_follow_links"
+    )]
+    pub follow_links: bool,
+
+    /// Do not add linked local files; such links are removed.
+    #[arg(
+        long = "no-follow-links",
+        global = true,
+        overrides_with = "follow_links"
+    )]
+    pub no_follow_links: bool,
 }
 
 #[cfg(test)]
@@ -214,6 +231,15 @@ mod tests {
         assert!(cli.flags.offline && !cli.flags.no_offline && cli.flags.verbose);
         let cli = Cli::try_parse_from(["md2epub", "a.md", "-v", "--no-verbose"]).unwrap();
         assert!(!cli.flags.verbose && cli.flags.no_verbose);
+    }
+
+    #[test]
+    fn follow_links_flags() {
+        let cli = Cli::try_parse_from(["md2epub", "a.md", "--no-follow-links"]).unwrap();
+        assert!(cli.flags.no_follow_links && !cli.flags.follow_links);
+        let cli = Cli::try_parse_from(["md2epub", "a.md", "--no-follow-links", "--follow-links"])
+            .unwrap();
+        assert!(cli.flags.follow_links && !cli.flags.no_follow_links);
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //!     math::transform(&doc, ctx)
 //!     assets::transform(&doc, ctx)            (img, inline <svg>, CSS url())
 //!     chapters += html::split(&doc, ctx)      (serializes each chapter body to XHTML)
+//! linked files (breadth-first, see `linked`) += chapters / "Linked files" pages
 //! html::fix_links(&mut chapters)
 //! chapters = notes::insert(chapters, ctx)
 //! epub::write(Book { meta, chapters, resources, css, cover }, out_path)
@@ -21,8 +22,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use crate::cli::Cli;
 use crate::ctx::Ctx;
 use crate::markdown::{self, Rendered};
-use crate::model::{Book, Options};
-use crate::{assets, config, dom, epub, html, math, mermaid, notes, style};
+use crate::model::{Book, Chapter, Heading, Options};
+use crate::{assets, config, dom, epub, html, linked, math, mermaid, notes, style};
 
 /// Stack size of the conversion thread. The DOM stages walk the tree
 /// recursively, so deeply nested input needs more than the default stack.
@@ -201,45 +202,16 @@ pub fn build_book(
         ctx.warn(n);
     }
     let mut chapters = Vec::new();
+    let mut follower = linked::Follower::new(inputs, ctx.opts.follow_links);
     for (i, input) in inputs.iter().enumerate() {
-        ctx.info(format!("processing {}", input.display()));
-        ctx.current_input = input.clone();
-        ctx.base_dir = match input.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => PathBuf::from("."),
-        };
-        let (text, encoding_warning) = read_input(input)?;
-        if let Some(w) = encoding_warning {
-            ctx.warn(w);
-        }
-        let html = match InputKind::of(input)? {
-            InputKind::Markdown => {
-                let rendered = match first_rendered.take().filter(|_| i == 0) {
-                    Some(r) => r,
-                    None => markdown::render(&text)
-                        .with_context(|| format!("rendering {}", input.display()))?,
-                };
-                rendered.html
-            }
-            InputKind::Html if html::is_xhtml_input(input, &text) => html::xhtml_to_html(&text),
-            InputKind::Html => text,
-        };
-        let doc = dom::parse(&html);
-        let depth = dom::max_depth(&doc);
-        if depth > MAX_DOM_DEPTH {
-            bail!(
-                "{}: elements are nested {depth} levels deep (the limit is {MAX_DOM_DEPTH})",
-                input.display()
-            );
-        }
-        html::sanitize(&doc, &mut ctx)?;
-        mermaid::transform(&doc, &mut ctx)?;
-        math::transform(&doc, &mut ctx)?;
-        assets::transform(&doc, &mut ctx)?;
-        chapters.extend(html::split(&doc, &mut ctx)?);
+        let first = first_rendered.take().filter(|_| i == 0);
+        let input_chapters = convert_document(input, first, &mut ctx)?;
+        follower.scan(&input_chapters, &mut ctx);
+        chapters.extend(input_chapters);
     }
+    add_linked_files(&mut follower, &mut chapters, &mut ctx);
     let resource_hrefs: Vec<String> = ctx.resources().iter().map(|r| r.href.clone()).collect();
-    for w in html::fix_links_with_resources(&mut chapters, &resource_hrefs) {
+    for w in html::fix_links_full(&mut chapters, &resource_hrefs, follower.skipped()) {
         ctx.warn(w);
     }
     let chapters = notes::insert(chapters, &mut ctx)?;
@@ -277,6 +249,118 @@ pub fn build_book(
         cover,
     };
     Ok((book, ctx))
+}
+
+/// Reads, renders and splits one Markdown or HTML document. `rendered` may
+/// hold its already rendered Markdown.
+fn convert_document(
+    input: &Path,
+    rendered: Option<Rendered>,
+    ctx: &mut Ctx,
+) -> Result<Vec<Chapter>> {
+    ctx.info(format!("processing {}", input.display()));
+    let (text, encoding_warning) = read_input(input)?;
+    if let Some(w) = encoding_warning {
+        ctx.warn(w);
+    }
+    let html = match InputKind::of(input)? {
+        InputKind::Markdown => {
+            let rendered = match rendered {
+                Some(r) => r,
+                None => markdown::render(&text)
+                    .with_context(|| format!("rendering {}", input.display()))?,
+            };
+            rendered.html
+        }
+        InputKind::Html if html::is_xhtml_input(input, &text) => html::xhtml_to_html(&text),
+        InputKind::Html => text,
+    };
+    convert_html(&html, input, ctx)
+}
+
+/// Runs the DOM stages on the HTML of `source` and splits it into chapters.
+fn convert_html(html: &str, source: &Path, ctx: &mut Ctx) -> Result<Vec<Chapter>> {
+    ctx.current_input = source.to_path_buf();
+    ctx.base_dir = match source.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let doc = dom::parse(html);
+    let depth = dom::max_depth(&doc);
+    if depth > MAX_DOM_DEPTH {
+        bail!(
+            "{}: elements are nested {depth} levels deep (the limit is {MAX_DOM_DEPTH})",
+            source.display()
+        );
+    }
+    html::sanitize(&doc, ctx)?;
+    mermaid::transform(&doc, ctx)?;
+    math::transform(&doc, ctx)?;
+    assets::transform(&doc, ctx)?;
+    html::split(&doc, ctx)
+}
+
+/// Adds the local files linked from the chapters (see [`linked`]):
+/// documents as chapters in breadth-first order, then a "Linked files"
+/// section with one page per other file. Files that fail are recorded in
+/// the follower, so their links are removed with the reason.
+fn add_linked_files(follower: &mut linked::Follower, chapters: &mut Vec<Chapter>, ctx: &mut Ctx) {
+    // Linked files never name the book.
+    let title_hint = ctx.title_hint.clone();
+    let mut pages = Vec::new();
+    while let Some((path, kind)) = follower.next_file() {
+        if kind.is_page() {
+            pages.push((path, kind));
+            continue;
+        }
+        ctx.info(format!("adding linked file {}", path.display()));
+        match convert_document(&path, None, ctx) {
+            Ok(new) => {
+                follower.scan(&new, ctx);
+                chapters.extend(new);
+            }
+            Err(e) => follower.skip(&path, format!("{e:#}")),
+        }
+    }
+    if pages.is_empty() {
+        ctx.title_hint = title_hint;
+        return;
+    }
+    let section_file = ctx.next_chapter_file();
+    let mut page_chapters = Vec::new();
+    let mut toc = Vec::new();
+    for (path, kind) in pages {
+        ctx.info(format!("adding linked file {}", path.display()));
+        let result = linked::page_html(&path, kind)
+            .map_err(|e| anyhow!(e))
+            .and_then(|html| convert_html(&html, &path, ctx));
+        match result {
+            Ok(new) if !new.is_empty() => {
+                toc.push((new[0].file_name.clone(), linked::display_name(&path)));
+                page_chapters.extend(new);
+            }
+            Ok(_) => follower.skip(&path, "nothing to show".into()),
+            Err(e) => follower.skip(&path, format!("{e:#}")),
+        }
+    }
+    ctx.title_hint = title_hint;
+    if page_chapters.is_empty() {
+        return;
+    }
+    let id = ctx.unique_id("linked-files");
+    chapters.push(Chapter {
+        title: linked::SECTION_TITLE.into(),
+        file_name: section_file,
+        body_xhtml: linked::section_html(&id, &toc),
+        headings: vec![Heading {
+            level: 1,
+            text: linked::SECTION_TITLE.into(),
+            id,
+        }],
+        in_toc: true,
+        source: None,
+    });
+    chapters.extend(page_chapters);
 }
 
 /// Reads an input file as text (see [`decode_text`]). The second value is a
