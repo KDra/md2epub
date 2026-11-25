@@ -64,6 +64,8 @@ struct State {
     requests: Vec<Req>,
     /// The next PUT answers 409 after another "user" bumped the version.
     conflict_once: bool,
+    /// Every request is redirected to `/moved` + its path (a moved base URL).
+    redirect: bool,
 }
 
 struct Mock {
@@ -191,11 +193,22 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<State>>, base: &str) -> std::io::R
         headers,
         body,
     };
-    let (status, json) = {
+    let (status, json, redirect) = {
         let mut st = state.lock().unwrap();
         st.requests.push(req.clone());
-        handle(&mut st, &req, base)
+        let redirect = st.redirect;
+        let (status, json) = handle(&mut st, &req, base);
+        (status, json, redirect)
     };
+    if redirect {
+        let origin = base.strip_suffix(CONTEXT).unwrap();
+        let mut out = stream;
+        write!(
+            out,
+            "HTTP/1.1 302 Found\r\nLocation: {origin}/moved{target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )?;
+        return out.flush();
+    }
     let text = if json.is_null() {
         String::new()
     } else {
@@ -1150,4 +1163,467 @@ fn publish_settings_come_from_the_user_config() {
         "{}",
         r.stdout()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Regressions
+// ---------------------------------------------------------------------------
+
+fn put_bodies(mock: &Mock) -> Vec<Value> {
+    mock.requests()
+        .into_iter()
+        .filter(|r| r.method == "PUT")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+#[test]
+fn updates_keep_the_parent_unless_parent_id_is_given_on_the_command_line() {
+    let mock = Mock::start();
+    let tmp = TempDir::new().unwrap();
+    let md = tmp.path().join("t.md");
+    std::fs::write(&md, "# T\n\nx\n").unwrap();
+    let saved_parent = mock.add_page("Saved Parent", 1);
+    let new_parent = mock.add_page("New Parent", 1);
+    let id = mock.add_page("Old", 4);
+    {
+        let mut st = mock.state.lock().unwrap();
+        let p = st.pages.get_mut(&id).unwrap();
+        p.space = "OTHER".into();
+        p.ancestors = vec!["1".into()];
+    }
+    std::fs::write(
+        tmp.path().join("no-config.toml"),
+        format!("confluence-parent-id = \"{saved_parent}\"\n"),
+    )
+    .unwrap();
+    // The saved parent only places new pages: the update has no ancestors.
+    let r = run(
+        &publish_args(
+            &mock,
+            &[md.to_str().unwrap(), "--page-id", &id, "--dry-run"],
+        ),
+        Some(TOKEN),
+        tmp.path(),
+    )
+    .ok();
+    assert!(!r.stdout().contains("moved"), "{}", r.stdout());
+    run(
+        &publish_args(&mock, &[md.to_str().unwrap(), "--page-id", &id]),
+        Some(TOKEN),
+        tmp.path(),
+    )
+    .ok();
+    let puts = put_bodies(&mock);
+    assert_eq!(puts.len(), 1);
+    assert!(puts[0].get("ancestors").is_none(), "{}", puts[0]);
+    assert_eq!(puts[0]["space"]["key"], "OTHER");
+    assert_eq!(mock.page(&id).ancestors, vec!["1".to_string()]);
+
+    // An explicit --parent-id moves the page, and the dry run says so.
+    let r = run(
+        &publish_args(
+            &mock,
+            &[
+                md.to_str().unwrap(),
+                "--page-id",
+                &id,
+                "--parent-id",
+                &new_parent,
+                "--dry-run",
+            ],
+        ),
+        Some(TOKEN),
+        tmp.path(),
+    )
+    .ok();
+    assert!(
+        r.stdout()
+            .contains(&format!("moved under page {new_parent}")),
+        "{}",
+        r.stdout()
+    );
+    assert_eq!(put_bodies(&mock).len(), 1);
+    let r = run(
+        &publish_args(
+            &mock,
+            &[
+                md.to_str().unwrap(),
+                "--page-id",
+                &id,
+                "--parent-id",
+                &new_parent,
+            ],
+        ),
+        Some(TOKEN),
+        tmp.path(),
+    )
+    .ok();
+    assert!(r.stderr().contains("moved page"), "{}", r.stderr());
+    assert_eq!(mock.page(&id).ancestors, vec![new_parent.clone()]);
+
+    // The explicit parent is checked on the --page-id path too.
+    let writes = mock.writes().len();
+    let r = run(
+        &publish_args(
+            &mock,
+            &[
+                md.to_str().unwrap(),
+                "--page-id",
+                &id,
+                "--parent-id",
+                "999999",
+            ],
+        ),
+        Some(TOKEN),
+        tmp.path(),
+    )
+    .fails();
+    assert!(
+        r.stderr().contains("checking --parent-id"),
+        "{}",
+        r.stderr()
+    );
+    assert_eq!(mock.writes().len(), writes);
+}
+
+#[test]
+fn redirects_are_not_followed_and_name_the_new_base() {
+    let mock = Mock::start();
+    let tmp = TempDir::new().unwrap();
+    let md = tmp.path().join("t.md");
+    std::fs::write(&md, "# T\n").unwrap();
+    let id = mock.add_page("T", 1);
+    mock.state.lock().unwrap().redirect = true;
+    let r = run(
+        &publish_args(&mock, &[md.to_str().unwrap(), "--page-id", &id]),
+        Some(TOKEN),
+        tmp.path(),
+    )
+    .fails();
+    let err = r.stderr();
+    let origin = mock.base.strip_suffix(CONTEXT).unwrap();
+    assert!(err.contains("redirects (HTTP 302)"), "{err}");
+    assert!(
+        err.contains(&format!("--url {origin}/moved{CONTEXT}")),
+        "{err}"
+    );
+    assert!(
+        !err.contains("401") && !err.contains("token is valid"),
+        "{err}"
+    );
+    // Nothing went to the redirect target.
+    assert_eq!(mock.requests().len(), 1, "{:?}", mock.requests());
+}
+
+#[test]
+fn the_token_is_not_sent_over_plain_http_to_another_host() {
+    let tmp = TempDir::new().unwrap();
+    let md = tmp.path().join("t.md");
+    std::fs::write(&md, "# T\n").unwrap();
+    let r = run(
+        &[
+            "publish",
+            md.to_str().unwrap(),
+            "--url",
+            "http://wiki.example.invalid/c",
+            "--space",
+            "DOCS",
+        ],
+        Some(TOKEN),
+        tmp.path(),
+    )
+    .fails();
+    assert!(r.stderr().contains("plain http://"), "{}", r.stderr());
+    assert!(
+        r.stderr().contains("--allow-insecure-http"),
+        "{}",
+        r.stderr()
+    );
+    // Saving such a URL warns.
+    let r = run(
+        &[
+            "config",
+            "set",
+            "confluence-url",
+            "http://wiki.example.com/c",
+        ],
+        None,
+        tmp.path(),
+    )
+    .ok();
+    assert!(
+        r.stderr().contains("--allow-insecure-http"),
+        "{}",
+        r.stderr()
+    );
+    let r = run(
+        &[
+            "config",
+            "set",
+            "confluence-url",
+            "https://wiki.example.com/c",
+        ],
+        None,
+        tmp.path(),
+    )
+    .ok();
+    assert!(!r.stderr().contains("warning"), "{}", r.stderr());
+}
+
+#[test]
+fn personal_space_keys_and_short_tokens() {
+    let mock = Mock::start();
+    let tmp = TempDir::new().unwrap();
+    let md = tmp.path().join("t.md");
+    std::fs::write(&md, "# T\n").unwrap();
+    run(
+        &["config", "set", "confluence-space", "~john@corp.com"],
+        None,
+        tmp.path(),
+    )
+    .ok();
+    // The key passes the check and reaches the server, percent-encoded.
+    let r = run(
+        &[
+            "publish",
+            md.to_str().unwrap(),
+            "--url",
+            &mock.url,
+            "--space",
+            "~john@corp.com",
+        ],
+        Some(TOKEN),
+        tmp.path(),
+    )
+    .fails();
+    assert!(
+        r.stderr().contains("space ~john@corp.com not found"),
+        "{}",
+        r.stderr()
+    );
+    assert!(
+        mock.requests()
+            .iter()
+            .any(|q| q.path == "/rest/api/space/%7Ejohn%40corp%2Ecom")
+    );
+    // A one-letter placeholder token does not garble the message.
+    let r = run(
+        &[
+            "publish",
+            md.to_str().unwrap(),
+            "--url",
+            &mock.url,
+            "--space",
+            "a b",
+        ],
+        Some("x"),
+        tmp.path(),
+    )
+    .fails();
+    assert!(r.stderr().contains("expected letters"), "{}", r.stderr());
+}
+
+#[test]
+fn publish_refuses_output_flags_and_warns_about_ignored_conversion_flags() {
+    let mock = Mock::start();
+    let tmp = TempDir::new().unwrap();
+    let md = tmp.path().join("t.md");
+    std::fs::write(&md, "# T\n").unwrap();
+    for extra in [
+        vec!["-o", "zzz.epub"],
+        vec!["--format", "epub"],
+        vec!["--output-location", "input"],
+    ] {
+        let mut args = vec![md.to_str().unwrap(), "--dry-run"];
+        args.extend(extra.iter().copied());
+        let r = run(&publish_args(&mock, &args), Some(TOKEN), tmp.path()).fails();
+        assert!(r.stderr().contains("does not apply"), "{}", r.stderr());
+    }
+    assert!(!tmp.path().join("zzz.epub").exists());
+    assert!(mock.requests().is_empty());
+
+    let (dir, _) = export(tmp.path());
+    let r = run(
+        &publish_args(
+            &mock,
+            &[
+                dir.to_str().unwrap(),
+                "--dry-run",
+                "--math",
+                "off",
+                "--confluence-toc",
+            ],
+        ),
+        Some(TOKEN),
+        tmp.path(),
+    )
+    .ok();
+    let err = r.stderr();
+    assert!(
+        err.contains("--math") && err.contains("--confluence-toc") && err.contains("--offline"),
+        "{err}"
+    );
+    assert!(err.contains("ignored"), "{err}");
+    // --title applies to an export directory without a warning.
+    let r = run(
+        &[
+            "publish",
+            dir.to_str().unwrap(),
+            "--url",
+            &mock.url,
+            "--space",
+            "DOCS",
+            "--dry-run",
+            "--title",
+            "Other",
+        ],
+        Some(TOKEN),
+        tmp.path(),
+    )
+    .ok();
+    assert!(!r.stderr().contains("warning"), "{}", r.stderr());
+    assert!(r.stdout().contains("\"Other\""), "{}", r.stdout());
+    assert!(mock.writes().is_empty());
+
+    // EPUB-only options are not listed in `publish --help`.
+    let help = run(&["publish", "--help"], None, tmp.path()).ok().stdout();
+    for flag in [
+        "--cover",
+        "--output-location",
+        "--notes-style",
+        "--css ",
+        "--output ",
+    ] {
+        assert!(!help.contains(flag), "{flag}: {help}");
+    }
+    assert!(help.contains("Page title"), "{help}");
+}
+
+#[test]
+fn a_directory_with_a_foreign_manifest_is_left_alone() {
+    let tmp = TempDir::new().unwrap();
+    let md = tmp.path().join("t.md");
+    std::fs::write(&md, "# T\n").unwrap();
+    let webapp = tmp.path().join("webapp");
+    std::fs::create_dir_all(webapp.join("attachments")).unwrap();
+    let foreign = "{\"name\":\"my-ext\",\"manifest_version\":3}";
+    std::fs::write(webapp.join("manifest.json"), foreign).unwrap();
+    std::fs::write(webapp.join("attachments/keep.txt"), b"precious").unwrap();
+    let r = run(
+        &[
+            md.to_str().unwrap(),
+            "--format",
+            "confluence",
+            "-o",
+            "webapp",
+        ],
+        None,
+        tmp.path(),
+    )
+    .ok();
+    assert!(r.stderr().contains("t.confluence"), "{}", r.stderr());
+    assert_eq!(
+        std::fs::read(webapp.join("attachments/keep.txt")).unwrap(),
+        b"precious"
+    );
+    assert_eq!(
+        std::fs::read_to_string(webapp.join("manifest.json")).unwrap(),
+        foreign
+    );
+    assert!(webapp.join("t.confluence/page.xml").is_file());
+    let r = run(
+        &[
+            "publish",
+            "webapp",
+            "--url",
+            "https://w.example",
+            "--space",
+            "DOCS",
+        ],
+        Some(TOKEN),
+        tmp.path(),
+    )
+    .fails();
+    assert!(
+        r.stderr()
+            .contains("not a directory written by --format confluence"),
+        "{}",
+        r.stderr()
+    );
+}
+
+#[test]
+fn book_toml_with_an_epub_output_builds_despite_a_confluence_default() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(
+        tmp.path().join("no-config.toml"),
+        "format = \"confluence\"\n",
+    )
+    .unwrap();
+    let bk = tmp.path().join("bk");
+    std::fs::create_dir(&bk).unwrap();
+    std::fs::write(bk.join("ch.md"), "# Ch\n\ntext\n").unwrap();
+    std::fs::write(
+        bk.join("book.toml"),
+        "inputs = [\"ch.md\"]\noutput = \"out/book.epub\"\n",
+    )
+    .unwrap();
+    for args in [vec!["bk/book.toml"], vec!["build", "bk/book.toml"]] {
+        let _ = std::fs::remove_dir_all(bk.join("out"));
+        run(&args, None, tmp.path()).ok();
+        assert!(bk.join("out/book.epub").is_file(), "{args:?}");
+    }
+    // Without an .epub output the user default still applies.
+    run(&["bk/ch.md"], None, tmp.path()).ok();
+    assert!(tmp.path().join("ch.confluence/manifest.json").is_file());
+}
+
+#[test]
+fn linked_documents_keep_linked_images_and_number_footnotes_through() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::copy(fixtures().join("photo.jpg"), tmp.path().join("photo.jpg")).unwrap();
+    std::fs::write(
+        tmp.path().join("a.md"),
+        "# A Doc\n\n[![photo](photo.jpg)](b.md) [![p2](photo.jpg)](#a-doc)\n\nNote.[^n]\n\n[^n]: First note.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("b.md"),
+        "# B Doc\n\nOther.[^n]\n\n[^n]: Second note.\n",
+    )
+    .unwrap();
+    let r = run(
+        &["a.md", "--format", "confluence", "--math", "off"],
+        None,
+        tmp.path(),
+    )
+    .ok();
+    assert!(
+        r.stderr().contains("1 attachments, 0 warnings"),
+        "{}",
+        r.stderr()
+    );
+    let out = tmp.path().join("a.confluence");
+    let page = std::fs::read_to_string(out.join("page.xml")).unwrap();
+    parse_storage(&page);
+    let m = manifest(&out);
+    let photo = m["attachments"][0]["filename"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for alt in ["photo", "p2"] {
+        assert!(
+            page.contains(&format!(
+                "<ac:link-body><ac:image ac:alt=\"{alt}\"><ri:attachment ri:filename=\"{photo}\" /></ac:image></ac:link-body>"
+            )),
+            "{alt}: {page}"
+        );
+    }
+    assert!(
+        page.contains("<![CDATA[1]]>") && page.contains("<![CDATA[2]]>"),
+        "{page}"
+    );
+    let notes = &page[page.find("<h2>Footnotes</h2>").unwrap()..];
+    assert_eq!(notes.matches("<ol>").count(), 1, "{page}");
 }

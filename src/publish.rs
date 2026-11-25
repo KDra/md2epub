@@ -24,9 +24,17 @@
 //! name is unchanged; its size and the `sha256:` in its comment are
 //! compared too, and a mismatch re-uploads it.
 //!
+//! The parent page (`--parent-id`, or `confluence-parent-id` from a config)
+//! is where a *new* page is created. An existing page stays where it is
+//! (`ancestors` is left out of the update), unless `--parent-id` is given
+//! on the command line: then the update moves it under that page.
+//!
 //! The personal access token comes from an environment variable and is
 //! sent as `Authorization: Bearer`. It is never printed: every message that
-//! leaves this module goes through [`redact`].
+//! leaves this module goes through [`redact`]. It is only sent over HTTPS,
+//! or plain HTTP to this machine (`localhost`, `127.0.0.1`, `[::1]`), unless
+//! `--allow-insecure-http` is given. Redirects are not followed (ureq would
+//! drop the token on the way); a redirect is an error that names its target.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -56,13 +64,89 @@ const COMMENT_PREFIX: &str = "md2epub sha256:";
 /// Body of a new page while its attachments upload.
 const PLACEHOLDER: &str = "<p><em>Publishing with md2epub\u{2026}</em></p>";
 
+/// Tokens shorter than this are not redacted: they are not real personal
+/// access tokens (those have 44 characters), and replacing a short string
+/// everywhere would garble unrelated words in the message.
+const MIN_REDACT_LEN: usize = 8;
+
 /// Replaces every occurrence of `token` in `text` with `***`.
 pub fn redact(text: &str, token: &str) -> String {
-    if token.is_empty() {
+    if token.chars().count() < MIN_REDACT_LEN {
         text.to_string()
     } else {
         text.replace(token, "***")
     }
+}
+
+/// Command-line flags that change the conversion, by name, for messages.
+fn conversion_flags(f: &crate::cli::Flags) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    let mut add = |set: bool, name: &'static str| {
+        if set {
+            v.push(name);
+        }
+    };
+    add(f.profile.is_some(), "--profile");
+    add(!f.authors.is_empty(), "--author");
+    add(f.lang.is_some(), "--lang");
+    add(f.cover.is_some(), "--cover");
+    add(f.split_level.is_some(), "--split-level");
+    add(f.notes.is_some(), "--notes");
+    add(f.notes_style.is_some(), "--notes-style");
+    add(f.notes_pages.is_some(), "--notes-pages");
+    add(f.margin.is_some(), "--margin");
+    add(f.line_spacing.is_some(), "--line-spacing");
+    add(f.math.is_some(), "--math");
+    add(f.svg.is_some(), "--svg");
+    add(f.grayscale || f.no_grayscale, "--grayscale");
+    add(f.css.is_some(), "--css");
+    add(f.offline || f.no_offline, "--offline");
+    add(f.follow_links || f.no_follow_links, "--follow-links");
+    add(f.link_root.is_some(), "--link-root");
+    add(f.format.is_some(), "--format");
+    add(f.confluence_toc || f.no_confluence_toc, "--confluence-toc");
+    v
+}
+
+/// Refuses options that write files: `publish` only uploads.
+fn check_no_output_flags(f: &crate::cli::Flags) -> Result<()> {
+    let given = [
+        (f.output.is_some(), "-o/--output"),
+        (f.output_location.is_some(), "--output-location"),
+        (
+            f.format == Some(crate::model::OutputFormat::Epub),
+            "--format epub",
+        ),
+    ];
+    if let Some((_, name)) = given.iter().find(|(set, _)| *set) {
+        bail!(
+            "{name} does not apply to `md2epub publish`, which writes no file; \
+             to write a file, run `md2epub <inputs> -o FILE` (EPUB) or \
+             `md2epub <inputs> --format confluence -o DIR` (export directory)"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `base` (`http(s)://host[:port]/...`) is plain HTTP to another
+/// machine, where the token would travel unencrypted.
+pub(crate) fn is_insecure_remote(base: &str) -> bool {
+    let lower = base.to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    let loopback = host == "localhost"
+        || host.ends_with(".localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    !loopback
 }
 
 /// Runs `md2epub publish`. Progress goes to `log` (stderr), the page URL
@@ -95,16 +179,29 @@ fn run_with_token(
             args.token_env
         );
     }
+    check_no_output_flags(&cli.flags)?;
     let all_inputs: Vec<PathBuf> = cli.inputs.iter().chain(&args.inputs).cloned().collect();
     let (export, opts, verbose) = match all_inputs.as_slice() {
         [dir] if dir.is_dir() => {
             if !confluence::is_export_dir(dir) {
                 bail!(
-                    "{} is a directory without {}; give Markdown/HTML files, a book.toml, \
-                     or a directory written by --format confluence",
+                    "{} is not a directory written by --format confluence (it has no md2epub {}); \
+                     give Markdown/HTML files, a book.toml, or such a directory",
                     dir.display(),
                     confluence::MANIFEST_FILE
                 );
+            }
+            let ignored = conversion_flags(&cli.flags);
+            if !ignored.is_empty() {
+                writeln!(
+                    log,
+                    "warning: {} is already converted, so {} {} ignored; \
+                     to change the conversion, publish the Markdown/HTML inputs \
+                     or export them again with --format confluence",
+                    dir.display(),
+                    ignored.join(", "),
+                    if ignored.len() == 1 { "is" } else { "are" }
+                )?;
             }
             let mut export = confluence::read_dir(dir)?;
             if let Some(t) = cli.flags.title.as_ref().filter(|t| !t.trim().is_empty()) {
@@ -142,14 +239,32 @@ fn run_with_token(
             )
         })?,
     };
+    if is_insecure_remote(&base) {
+        if !args.allow_insecure_http {
+            bail!(
+                "{base} uses plain http://, which would send the personal access token \
+                 unencrypted; use the https:// URL of the server, or pass \
+                 --allow-insecure-http if you really mean it"
+            );
+        }
+        writeln!(
+            log,
+            "warning: --allow-insecure-http: the token is sent unencrypted to {base}"
+        )?;
+    }
     let space = match &args.space {
         Some(s) => Some(config::check_space_key(s).context("--space")?),
         None => opts.confluence.space.clone(),
     };
-    let parent = match &args.parent_id {
+    // An explicit --parent-id also moves an existing page; the saved
+    // default only places new pages.
+    let move_to = match &args.parent_id {
         Some(p) => Some(config::check_content_id(p).context("--parent-id")?),
-        None => opts.confluence.parent_id.clone(),
+        None => None,
     };
+    let parent = move_to
+        .clone()
+        .or_else(|| opts.confluence.parent_id.clone());
     let page_id = match &args.page_id {
         Some(p) => Some(config::check_content_id(p).context("--page-id")?),
         None => None,
@@ -159,6 +274,7 @@ fn run_with_token(
         export: &export,
         space,
         parent,
+        move_to,
         page_id,
         dry_run: args.dry_run,
         prune: args.prune_attachments,
@@ -174,7 +290,10 @@ fn run_with_token(
 struct Plan<'a> {
     export: &'a Export,
     space: Option<String>,
+    /// Parent of a new page.
     parent: Option<String>,
+    /// Parent an existing page moves to (`--parent-id` on the command line).
+    move_to: Option<String>,
     page_id: Option<String>,
     dry_run: bool,
     prune: bool,
@@ -244,7 +363,12 @@ impl Plan<'_> {
             bail!("the page has no title; pass --title");
         }
         let page = match &self.page_id {
-            Some(id) => Some(client.get_page(id)?),
+            Some(id) => {
+                if let Some(p) = &self.move_to {
+                    client.get_page(p).context("checking --parent-id")?;
+                }
+                Some(client.get_page(id)?)
+            }
             None => {
                 let space = self.space.as_deref().ok_or_else(|| {
                     anyhow!(
@@ -319,7 +443,8 @@ impl Plan<'_> {
             "uploaded {} attachments",
             self.export.attachments.len()
         )?;
-        let updated = self.put_body(client, &page, title, log)?;
+        // The page was created under its parent; the update keeps it there.
+        let updated = self.put_body(client, &page, title, None, log)?;
         Ok(updated
             .url
             .or(page.url)
@@ -362,9 +487,14 @@ impl Plan<'_> {
             } else {
                 String::new()
             };
+            let moved = self
+                .move_to
+                .as_ref()
+                .map(|p| format!(", moved under page {p}"))
+                .unwrap_or_default();
             writeln!(
                 out,
-                "would update page \"{title}\" (id {}, version {} -> {}{rename})",
+                "would update page \"{title}\" (id {}, version {} -> {}{rename}{moved})",
                 page.id,
                 page.version,
                 page.version + 1
@@ -396,7 +526,10 @@ impl Plan<'_> {
                 Action::Skip => same += 1,
             }
         }
-        let updated = self.put_body(client, &page, title, log)?;
+        let updated = self.put_body(client, &page, title, self.move_to.as_deref(), log)?;
+        if let Some(p) = &self.move_to {
+            writeln!(log, "moved page \"{title}\" under page {p}")?;
+        }
         for (name, e) in &prune {
             client.delete(&format!("/rest/api/content/{}", enc(&e.id)))?;
             writeln!(log, "deleted attachment {name}")?;
@@ -416,11 +549,14 @@ impl Plan<'_> {
 
     /// Writes the page body as the next version; on a 409 conflict the
     /// current version is fetched again and the update retried once.
+    /// `ancestors` is sent only with `move_to`: Confluence moves a page to
+    /// the parent given there, and keeps the current parent without it.
     fn put_body(
         &self,
         client: &Client,
         page: &Page,
         title: &str,
+        move_to: Option<&str>,
         log: &mut dyn Write,
     ) -> Result<Page> {
         let space = page
@@ -438,7 +574,7 @@ impl Plan<'_> {
                 "version": { "number": version + 1, "message": "Published with md2epub" },
                 "body": { "storage": { "value": self.export.page_xml, "representation": "storage" } },
             });
-            if let Some(p) = &self.parent {
+            if let Some(p) = move_to {
                 body["ancestors"] = json!([{ "id": p }]);
             }
             let path = format!("/rest/api/content/{}", enc(&page.id));
@@ -525,6 +661,9 @@ impl Client {
             .timeout_global(Some(REQUEST_TIMEOUT))
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .http_status_as_error(false)
+            // ureq drops the Authorization header on a redirect, which
+            // would turn a wrong --url into a misleading 401.
+            .max_redirects(0)
             .user_agent(concat!("md2epub/", env!("CARGO_PKG_VERSION")))
             .tls_config(TlsConfig::builder().root_certs(roots).build())
             .build()
@@ -589,6 +728,19 @@ impl Client {
             .limit(64 * 1024 * 1024)
             .read_to_string()
             .unwrap_or_default();
+        if (300..400).contains(&status) {
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            return Err(HttpError {
+                status: Some(status),
+                message: redirect_message(method, &url, &self.base, path, status, &location),
+            });
+        }
         if !(200..300).contains(&status) {
             return Err(HttpError {
                 status: Some(status),
@@ -773,6 +925,48 @@ fn multipart(a: &Attachment) -> (String, Vec<u8>) {
     (format!("multipart/form-data; boundary={boundary}"), body)
 }
 
+/// The message for a redirect: where it leads, and the `--url` to use
+/// instead when the target is the same API path under another base.
+fn redirect_message(
+    method: &str,
+    url: &str,
+    base: &str,
+    path: &str,
+    status: u16,
+    location: &str,
+) -> String {
+    if location.is_empty() {
+        return format!(
+            "{method} {url}: the server answered with a redirect (HTTP {status}); \
+             check --url (the Confluence base URL, including its context path)"
+        );
+    }
+    // A relative target is resolved against the scheme and host of `base`.
+    let absolute = if location.starts_with('/') {
+        let origin_end = base
+            .find("://")
+            .map(|i| i + 3)
+            .and_then(|start| base[start..].find('/').map(|j| start + j))
+            .unwrap_or(base.len());
+        format!("{}{location}", &base[..origin_end])
+    } else {
+        location.to_string()
+    };
+    let target = absolute.split(['?', '#']).next().unwrap_or("");
+    let api_path = path.split('?').next().unwrap_or("");
+    let suggestion = target
+        .strip_suffix(api_path)
+        .filter(|b| b.starts_with("https://") || b.starts_with("http://"))
+        .map(|b| format!("; pass --url {}", b.trim_end_matches('/')))
+        .unwrap_or_else(|| {
+            "; pass the base URL it leads to (including the context path) as --url".into()
+        });
+    format!(
+        "{method} {url}: the server redirects (HTTP {status}) to {absolute}; \
+         md2epub does not follow redirects, so the token is never sent elsewhere{suggestion}"
+    )
+}
+
 /// A readable message for an error status, with the server's `message`.
 fn status_message(method: &str, url: &str, status: u16, body: &str) -> String {
     let server = serde_json::from_str::<Value>(body)
@@ -818,8 +1012,63 @@ mod tests {
 
     #[test]
     fn redaction() {
-        assert_eq!(redact("Bearer abc and abc", "abc"), "Bearer *** and ***");
+        assert_eq!(
+            redact("Bearer abcdefgh and abcdefgh", "abcdefgh"),
+            "Bearer *** and ***"
+        );
         assert_eq!(redact("x", ""), "x");
+        // A short placeholder token does not garble other words.
+        assert_eq!(
+            redact("expected letters and digits", "x"),
+            "expected letters and digits"
+        );
+    }
+
+    #[test]
+    fn plain_http_is_insecure_except_to_this_machine() {
+        assert!(is_insecure_remote("http://wiki.example.com/c"));
+        assert!(is_insecure_remote("HTTP://10.0.0.1:8090"));
+        assert!(!is_insecure_remote("https://wiki.example.com"));
+        assert!(!is_insecure_remote("http://127.0.0.1:8090/c"));
+        assert!(!is_insecure_remote("http://localhost:8090"));
+        assert!(!is_insecure_remote("http://[::1]:8090/c"));
+        assert!(is_insecure_remote("http://127.0.0.1.evil.example/c"));
+    }
+
+    #[test]
+    fn redirect_messages_name_the_new_base() {
+        let m = redirect_message(
+            "GET",
+            "https://w.example/c/rest/api/content/42?expand=version",
+            "https://w.example/c",
+            "/rest/api/content/42?expand=version",
+            302,
+            "https://w.example/c2/rest/api/content/42?expand=version",
+        );
+        assert!(m.contains("--url https://w.example/c2"), "{m}");
+        assert!(!m.contains("401") && !m.contains("token is valid"), "{m}");
+        let m = redirect_message(
+            "GET",
+            "http://h/c/rest/api/space/X",
+            "http://h/c",
+            "/rest/api/space/X",
+            301,
+            "/wiki/rest/api/space/X",
+        );
+        assert!(m.contains("to http://h/wiki/rest/api/space/X"), "{m}");
+        assert!(m.contains("--url http://h/wiki"), "{m}");
+        let m = redirect_message(
+            "GET",
+            "u",
+            "https://h",
+            "/rest/api/x",
+            302,
+            "https://sso/login",
+        );
+        assert!(
+            m.contains("https://sso/login") && m.contains("as --url"),
+            "{m}"
+        );
     }
 
     #[test]

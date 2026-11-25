@@ -93,8 +93,43 @@ pub fn command_with_defaults(
         .filter(|a| a.is_global_set())
         .map(|a| a.clone().hide(true))
         .collect();
-    cmd.mut_subcommand("config", |c| add_args(c, &globals))
+    let cmd = cmd.mut_subcommand("config", |c| add_args(c, &globals));
+    // `publish` writes no file and makes a page, not a book: hide the
+    // options that only shape an EPUB file (it refuses -o and warns
+    // about the rest), and describe --title as the page title.
+    let publish_args: Vec<clap::Arg> = cmd
+        .get_arguments()
+        .filter(|a| a.is_global_set())
+        .filter_map(|a| match a.get_id().as_str() {
+            "title" => Some(a.clone().help(
+                "Page title [default: front matter, then first heading, then file name; \
+                 for an export directory, its manifest title]",
+            )),
+            id if PUBLISH_HIDDEN.contains(&id) => Some(a.clone().hide(true)),
+            _ => None,
+        })
+        .collect();
+    cmd.mut_subcommand("publish", |c| c.args(publish_args))
 }
+
+/// Global options left out of `md2epub publish --help`.
+const PUBLISH_HIDDEN: &[&str] = &[
+    "output",
+    "output_location",
+    "profile",
+    "cover",
+    "notes",
+    "notes_style",
+    "notes_pages",
+    "margin",
+    "line_spacing",
+    "svg",
+    "css",
+    "format",
+    "split_level",
+    "authors",
+    "lang",
+];
 
 /// Adds `args` to `cmd` and all its subcommands.
 fn add_args(mut cmd: clap::Command, args: &[clap::Arg]) -> clap::Command {
@@ -188,7 +223,7 @@ pub struct PublishArgs {
     #[arg(long, value_name = "KEY")]
     pub space: Option<String>,
 
-    /// Create the page under this parent page id.
+    /// Create the page under this parent page id; given here, it also moves an existing page there.
     #[arg(long = "parent-id", value_name = "ID")]
     pub parent_id: Option<String>,
 
@@ -207,6 +242,10 @@ pub struct PublishArgs {
     /// Trust the CA certificates in this PEM file instead of the system store.
     #[arg(long = "ca-cert", value_name = "FILE")]
     pub ca_cert: Option<PathBuf>,
+
+    /// Send the token over plain http:// to another machine (it travels unencrypted).
+    #[arg(long = "allow-insecure-http")]
+    pub allow_insecure_http: bool,
 
     /// Environment variable that holds the personal access token.
     #[arg(
@@ -270,7 +309,7 @@ pub struct Flags {
     #[arg(short = 'o', long = "output", global = true, value_name = "FILE")]
     pub output: Option<PathBuf>,
 
-    /// Where the EPUB goes without -o: cwd (current directory) or input (beside the first input).
+    /// Where the output (EPUB or Confluence export) goes without -o: cwd (current directory) or input (beside the first input).
     #[arg(long = "output-location", global = true, value_name = "WHERE")]
     pub output_location: Option<OutputLocation>,
 
@@ -338,7 +377,7 @@ pub struct Flags {
     #[arg(long, global = true, value_name = "FILE")]
     pub css: Option<PathBuf>,
 
-    /// Do not fetch remote images.
+    /// Do not fetch remote images (EPUB: their alt text is kept; --format confluence: linked by URL).
     #[arg(long, global = true, overrides_with = "no_offline")]
     pub offline: bool,
 

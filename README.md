@@ -90,7 +90,7 @@ self-closed `<div/>`).
 | Option | Values | Default | Meaning |
 |---|---|---|---|
 | `-o, --output <FILE>` | path or directory | `<stem>.epub` | Output EPUB (see above). |
-| `--output-location <WHERE>` | `cwd`, `input` | `cwd` | Where the EPUB goes without `-o`: the current directory, or beside the first input. |
+| `--output-location <WHERE>` | `cwd`, `input` | `cwd` | Where the output (the EPUB, or the `.confluence` directory) goes without `-o`: the current directory, or beside the first input. |
 | `--profile <NAME>` | `scribe`, `remarkable`, `remarkable-pro`, `generic` | `generic` | Target device (see below). |
 | `--title <TITLE>` | text | front matter, then first `<h1>`, then file name | Book title. |
 | `--author <NAME>` | text, repeatable | front matter | Author(s). |
@@ -106,7 +106,7 @@ self-closed `<div/>`).
 | `--svg <MODE>` | `rasterize`, `keep` | from profile | Rasterize SVG to PNG, or keep it as SVG. |
 | `--grayscale` | flag | off | Convert all images to grayscale. `--no-grayscale` turns it off. |
 | `--css <FILE>` | path | none | Extra CSS appended after the built-in stylesheet. Fonts and images it references with `url(...)` (relative to the CSS file) are embedded. |
-| `--offline` | flag | off | Do not download remote images (their alt text is kept). `--no-offline` turns it off. |
+| `--offline` | flag | off | Do not download remote images (in an EPUB their alt text is kept; with `--format confluence` they are linked by URL). `--no-offline` turns it off. |
 | `-v, --verbose` | flag | off | Print progress and detailed diagnostics. `--no-verbose` turns it off. |
 | `--follow-links` | flag | on | Add linked local files to the book (see below). `--no-follow-links` turns it off. |
 | `--link-root <DIR>` | directory | git work tree of the inputs, else their common folder | Follow links only to files inside this folder; links that start with `/` resolve against it (see below). |
@@ -299,7 +299,11 @@ md2epub config set format confluence               # make it your default
 ```
 
 The output is a directory (named like the EPUB, with `.confluence` in place of `.epub`;
-`-o book.epub` is an error under `--format confluence`):
+`-o book.epub` is an error under `--format confluence`). An `.epub` output from
+`-o` or `book.toml` asks for an EPUB, so with `format = confluence` only as your
+default, a `book.toml` with `output = "book.epub"` still builds its EPUB. `-o DIR` on
+an existing directory that is not an md2epub export (even one with some other
+`manifest.json`) writes `DIR/<name>.confluence` inside it and never changes its files:
 
 | File | Contents |
 |---|---|
@@ -318,7 +322,9 @@ content maps to Confluence:
 | Fenced code | The **Code Block** macro with its language (`bash`, `py`, `js`, `rust`, …; an unknown language gives `none`). No highlighting markup is kept. |
 | Links to headings and between your documents | Links to anchors on the page. md2epub adds an **Anchor** macro for every heading and element id, because Confluence's own heading anchors change when the page title or a heading changes. |
 | External links | Plain links. |
-| Footnotes | Superscript links to a **Footnotes** section at the end of the page, with links back. |
+| Footnotes | Superscript links to one **Footnotes** list at the end of the page, numbered through all documents, with links back. |
+| Linked images (`[![alt](img.png)](#anchor)`) | The image inside the link (`<ac:link-body><ac:image>`), attached like any other image. |
+| Definition lists, captions, `div`/`section`/`center` | Paragraphs (a `dd` indented); block content inside them stays as blocks. |
 | Task lists | Confluence tasks (complete / incomplete). |
 | `<details>` | The **Expand** macro. |
 
@@ -340,17 +346,22 @@ md2epub publish book.toml --page-id 987654         # update a known page
 |---|---|
 | `--url <URL>` | Base URL of Confluence, including its context path if it has one (`https://example.com/confluence`). |
 | `--space <KEY>` | Space key. |
-| `--parent-id <ID>` | Create the page under this page (the number in `pageId=` of its URL). Without it, the page goes to the top of the space. |
+| `--parent-id <ID>` | Create the page under this page (the number in `pageId=` of its URL). Without it, the page goes to the top of the space. Given on the command line, it also **moves** an existing page under that page (the dry run says so); a saved `confluence-parent-id` only places new pages. |
 | `--title <TITLE>` | Page title (default: as for the book title: front matter, first heading, file name). |
 | `--page-id <ID>` | Update this page instead of looking for a page with the same title in the space. |
 | `--dry-run` | Print what would be created, updated, uploaded and deleted. Only read requests are sent. |
 | `--prune-attachments` | Delete attachments of the page that the new version does not use (including ones added by hand). |
 | `--ca-cert <FILE>` | Trust the CA certificates in this PEM file **instead of** the system trust store. |
 | `--token-env <NAME>` | Read the token from this environment variable (default `MD2EPUB_CONFLUENCE_TOKEN`). |
+| `--allow-insecure-http` | Allow an `http://` URL of another machine, which sends the token unencrypted. Without it, plain HTTP is only used for `localhost`/`127.0.0.1`/`[::1]`. |
 
 `url`, `space` and `parent-id` can be saved with `md2epub config set confluence-url …`,
-`confluence-space` and `confluence-parent-id`, or set in `book.toml`. Conversion options
-(`--offline`, `--math`, `--follow-links`, `--confluence-toc`, …) work as for an export.
+`confluence-space` and `confluence-parent-id`, or set in `book.toml`. A personal space key
+is `~` plus the user name (`~john@corp.com`). Conversion options
+(`--offline`, `--math`, `--follow-links`, `--confluence-toc`, …) work as for an export;
+for an export directory, which is already converted, they are ignored with a warning
+(only `--title` applies). `publish` writes no file, so `-o`, `--output-location` and
+`--format epub` are errors there.
 
 What publish does:
 
@@ -370,6 +381,8 @@ What publish does:
 Confluence Data Center and Server 7.9 and later. md2epub sends it as
 `Authorization: Bearer <token>` and reads it only from the environment: it is never accepted
 as an argument or a config key, and it is never printed (it is masked in error messages).
+md2epub does not follow redirects, because the token would not go along: a redirect is an
+error that names where it leads, so you can pass that base URL as `--url`.
 
 **Permissions.** The token's user needs **View** and **Add** (pages) permission in the
 space, **Add** for attachments, and **Delete** for attachments to use

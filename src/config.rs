@@ -330,6 +330,18 @@ pub fn resolve_with(
             css.display()
         );
     }
+    // An `.epub` output named on the command line, in book.toml or in front
+    // matter asks for an EPUB: it wins over a `format` that only comes from
+    // the user config (`md2epub config set format confluence`), so such
+    // books keep building.
+    if merged.format.is_none()
+        && merged.output.as_ref().is_some_and(|o| {
+            o.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("epub"))
+        })
+    {
+        merged.format = Some(OutputFormat::Epub);
+    }
     merged = merged.over(user.layer.clone());
 
     let mut opts = merged.into_options()?;
@@ -1007,15 +1019,21 @@ pub fn check_confluence_url(url: &str) -> Result<String> {
     Ok(url.strip_suffix("/rest/api").unwrap_or(url).to_string())
 }
 
-/// Checks a Confluence space key (letters, digits, `~` for personal spaces).
+/// Checks a Confluence space key: letters and digits for a global space;
+/// for a personal space (`~` plus the user name, as on Data Center),
+/// anything but whitespace and control characters, since user names may
+/// hold `@` and other characters. Keys are percent-encoded where used.
 pub fn check_space_key(key: &str) -> Result<String> {
     let key = key.trim();
-    if key.is_empty()
-        || key.len() > 255
-        || !key
+    let valid = match key.strip_prefix('~') {
+        Some(user) => {
+            !user.is_empty() && !user.chars().any(|c| c.is_whitespace() || c.is_control())
+        }
+        None => key
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '~' || c == '_' || c == '-' || c == '.')
-    {
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'),
+    };
+    if key.is_empty() || key.len() > 255 || !valid {
         bail!(
             "invalid space key '{key}': expected letters and digits such as DOCS (or ~user for a personal space)"
         );
@@ -2010,5 +2028,48 @@ mod tests {
             "https://w.example"
         );
         assert!(check_confluence_url("https://user@w.example").is_err());
+    }
+
+    #[test]
+    fn personal_space_keys_may_hold_user_name_characters() {
+        for key in ["~john@corp.com", "~ada", "~j.o+h'n", "DOCS", "my_space-1.0"] {
+            assert_eq!(check_space_key(key).unwrap(), key);
+        }
+        for key in ["", "~", "~a b", "~a\tb", "DO CS", "DO@CS", "A~B"] {
+            assert!(check_space_key(key).is_err(), "{key:?}");
+        }
+        let user =
+            UserConfig::from_toml_str("confluence-space = \"~john@corp.com\"", Path::new("."))
+                .unwrap();
+        assert_eq!(
+            defaults(&user).unwrap().confluence.space.as_deref(),
+            Some("~john@corp.com")
+        );
+    }
+
+    #[test]
+    fn an_epub_output_wins_over_the_user_config_format() {
+        let user = UserConfig::from_toml_str("format = \"confluence\"", Path::new(".")).unwrap();
+        let (_dir, book) = book_dir("inputs = [\"a.md\"]\noutput = \"out/book.epub\"\n");
+        let (o, _) = resolve_with(&cli(&["build", &path_str(&book)]), None, &user).unwrap();
+        assert_eq!(o.format, OutputFormat::Epub);
+        let a = book.with_file_name("a.md");
+        let (o, _) = resolve_with(&cli(&[&path_str(&a), "-o", "x.EPUB"]), None, &user).unwrap();
+        assert_eq!(o.format, OutputFormat::Epub);
+        // Without an .epub output the user default applies.
+        let (o, _) = resolve_with(&cli(&[&path_str(&a)]), None, &user).unwrap();
+        assert_eq!(o.format, OutputFormat::Confluence);
+        // An explicit format still wins (and -o book.epub is then an error).
+        let (o, _) = resolve_with(
+            &cli(&[&path_str(&a), "-o", "x.epub", "--format", "confluence"]),
+            None,
+            &user,
+        )
+        .unwrap();
+        assert_eq!(o.format, OutputFormat::Confluence);
+        let (_dir2, book2) =
+            book_dir("inputs = [\"a.md\"]\noutput = \"b.epub\"\nformat = \"confluence\"\n");
+        let (o, _) = resolve_with(&cli(&["build", &path_str(&book2)]), None, &user).unwrap();
+        assert_eq!(o.format, OutputFormat::Confluence);
     }
 }

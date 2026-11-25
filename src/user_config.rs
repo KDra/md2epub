@@ -484,6 +484,12 @@ fn set(path: &Path, raw_key: &str, values: &[String], out: &mut dyn Write) -> Re
         .map(|s| s.value)
         .unwrap_or_default();
     writeln!(out, "{key} = {shown} (saved in {})", path.display())?;
+    if key == "confluence-url" && crate::publish::is_insecure_remote(&shown) {
+        eprintln!(
+            "warning: {shown} uses plain http://; `md2epub publish` refuses to send the token \
+             there unencrypted unless you pass --allow-insecure-http (use the https:// URL if the server has one)"
+        );
+    }
     Ok(())
 }
 

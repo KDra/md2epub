@@ -32,8 +32,13 @@
 //!   [`code_language`]); highlighting spans are dropped.
 //! - Task lists become `<ac:task-list>`; strikethrough is
 //!   `<span style="text-decoration: line-through;">` as in the docs.
-//! - Footnote sections are collected into one "Footnotes" section at the
-//!   end of the page, with links back to the references.
+//! - The footnotes of all documents are collected into one numbered list
+//!   in a "Footnotes" section at the end of the page, with links back to
+//!   the references; the references show that page-wide number.
+//! - Block containers (`div`, `section`, `dd`, `figcaption`, ...) never
+//!   become a `<p>` around blocks: inline runs become paragraphs and
+//!   blocks stay blocks. A link to an anchor that the page lacks is
+//!   reported as a warning.
 //! - EPUB-only features (cover, note pages, margins, CSS, device profiles,
 //!   navigation) are ignored.
 
@@ -150,9 +155,31 @@ fn attachment_name(href: &str) -> Option<&str> {
 // Export directory
 // ---------------------------------------------------------------------------
 
-/// Whether `dir` looks like an export directory (it has a manifest).
+/// Whether `dir` is an export directory: it has a `manifest.json` whose
+/// `format` is md2epub's. A `manifest.json` of anything else (a web app,
+/// a browser extension) does not count, so such a directory is never
+/// overwritten.
 pub fn is_export_dir(dir: &Path) -> bool {
-    dir.is_dir() && dir.join(MANIFEST_FILE).is_file()
+    if !dir.is_dir() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(dir.join(MANIFEST_FILE)) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .is_ok_and(|m| m["format"].as_str() == Some(MANIFEST_FORMAT))
+}
+
+/// Whether `name` from a manifest is a plain file name: one normal path
+/// component, no separator, no drive prefix (`C:x`), not hidden.
+fn is_plain_file_name(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    !name.is_empty()
+        && !name.contains(['/', '\\', ':'])
+        && !name.starts_with('.')
+        && !name.chars().any(char::is_control)
+        && matches!(parts.next(), Some(std::path::Component::Normal(_)))
+        && parts.next().is_none()
 }
 
 /// Writes `export` to `dir` (created when missing). An existing directory
@@ -171,7 +198,7 @@ pub fn write_dir(export: &Export, dir: &Path) -> Result<()> {
             .is_none();
         if !empty && !is_export_dir(dir) {
             bail!(
-                "output directory {} is not empty and is not a Confluence export (no {MANIFEST_FILE}); \
+                "output directory {} is not empty and is not a Confluence export (no md2epub {MANIFEST_FILE}); \
                  choose another -o",
                 dir.display()
             );
@@ -244,8 +271,8 @@ pub fn read_dir(dir: &Path) -> Result<Export> {
         .ok_or_else(|| anyhow!("{}: missing title", mpath.display()))?
         .to_string();
     let page_name = m["page"].as_str().unwrap_or(PAGE_FILE);
-    if page_name.contains(['/', '\\']) || page_name.starts_with('.') {
-        bail!("{}: invalid page file name", mpath.display());
+    if !is_plain_file_name(page_name) {
+        bail!("{}: invalid page file name {page_name:?}", mpath.display());
     }
     let page = dir.join(page_name);
     let page_xml =
@@ -263,11 +290,7 @@ pub fn read_dir(dir: &Path) -> Result<Export> {
             .as_str()
             .ok_or_else(|| anyhow!("missing filename"))
             .with_context(ctx)?;
-        if filename.is_empty()
-            || filename.contains(['/', '\\'])
-            || filename.starts_with('.')
-            || filename.chars().any(char::is_control)
-        {
+        if !is_plain_file_name(filename) {
             return Err(anyhow!("invalid file name {filename:?}")).with_context(ctx);
         }
         let path = dir.join(ATTACHMENTS_DIR).join(filename);
@@ -441,6 +464,24 @@ pub fn to_storage(
         conv.chapter_anchor.insert(file, name);
     }
     conv.files = chapters.iter().map(|c| c.file_name.clone()).collect();
+    // Footnotes of all documents form one list, so they are numbered
+    // through the page; references show that number.
+    let mut number = 0;
+    for doc in &parsed {
+        for section in doc.descendants().filter(|n| is_footnote_section(*n)) {
+            for list in section
+                .children()
+                .filter(|c| c.has_tag_name("ol") || c.has_tag_name("ul"))
+            {
+                for li in list.children().filter(|c| c.has_tag_name("li")) {
+                    number += 1;
+                    if let Some(id) = li.attribute("id").filter(|i| !i.is_empty()) {
+                        conv.footnote_numbers.insert(id.to_string(), number);
+                    }
+                }
+            }
+        }
+    }
 
     if toc {
         conv.out
@@ -452,13 +493,21 @@ pub fn to_storage(
         {
             conv.anchor(&anchor);
         }
-        conv.blocks(doc.root_element());
+        conv.container(doc.root_element(), None, "<p>", "</p>", None);
         conv.out.push('\n');
     }
     if !conv.footnotes.is_empty() {
-        conv.out.push_str("<h2>Footnotes</h2>\n");
+        conv.out.push_str("<h2>Footnotes</h2>\n<ol>");
         let notes = std::mem::take(&mut conv.footnotes);
         conv.out.push_str(&notes);
+        conv.out.push_str("</ol>\n");
+    }
+    for name in &conv.linked {
+        if !conv.emitted.contains(name) {
+            conv.warnings.push(format!(
+                "link to #{name}: the page has no anchor of that name, so the link leads nowhere"
+            ));
+        }
     }
     let page = conv.out.trim().to_string() + "\n";
     Ok((page, conv.attachments, conv.warnings))
@@ -467,8 +516,18 @@ pub fn to_storage(
 #[derive(Default)]
 struct Converter {
     out: String,
-    /// Converted footnote lists, placed at the end of the page.
+    /// Converted footnote items (`<li>`) of every document, placed in one
+    /// list at the end of the page.
     footnotes: String,
+    /// Footnote id -> its number on the page.
+    footnote_numbers: HashMap<String, usize>,
+    /// Anchor macros written so far.
+    emitted: HashSet<String>,
+    /// Anchors that `<ac:link>`s point to.
+    linked: BTreeSet<String>,
+    /// Inside phrasing content (a paragraph, heading or inline element):
+    /// block containers are unwrapped instead of opening a `<p>`.
+    in_phrasing: bool,
     attachments: BTreeSet<String>,
     ids: HashSet<String>,
     /// Chapter file name -> anchor at its start.
@@ -503,9 +562,84 @@ const ANCHOR_INSIDE: &[&str] = &[
     "dt",
 ];
 
+/// Block-level elements: a container holding one of these cannot be a
+/// single `<p>`.
+const BLOCK_TAGS: &[&str] = &[
+    "p",
+    "ul",
+    "ol",
+    "menu",
+    "dl",
+    "dt",
+    "dd",
+    "li",
+    "table",
+    "pre",
+    "blockquote",
+    "div",
+    "section",
+    "article",
+    "main",
+    "header",
+    "footer",
+    "aside",
+    "nav",
+    "center",
+    "figure",
+    "figcaption",
+    "address",
+    "hgroup",
+    "search",
+    "form",
+    "fieldset",
+    "details",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+];
+
+/// Layout containers: their tag is dropped, their inline content goes into
+/// paragraphs and their blocks are kept.
+const CONTAINERS: &[&str] = &[
+    "div", "section", "article", "main", "header", "footer", "aside", "nav", "center", "figure",
+    "address", "hgroup", "search", "form", "fieldset",
+];
+
+fn is_block(n: Node) -> bool {
+    n.is_element() && BLOCK_TAGS.contains(&n.tag_name().name().to_ascii_lowercase().as_str())
+}
+
+/// Whether `nodes` hold anything visible (text or a kept element).
+fn has_content(nodes: &[Node]) -> bool {
+    nodes.iter().any(|c| match c.node_type() {
+        NodeType::Text => c.text().is_some_and(|t| !t.trim().is_empty()),
+        NodeType::Element => !DROP.contains(&c.tag_name().name().to_ascii_lowercase().as_str()),
+        _ => false,
+    })
+}
+
+fn is_footnote_section(n: Node) -> bool {
+    n.has_tag_name("section") && (has_class(n, "footnotes") || n.has_attribute("data-footnotes"))
+}
+
+/// Whether a `<p>` holds only one display formula left as code (`--math
+/// off`), which becomes a code macro of its own.
+fn only_display_math(p: Node) -> bool {
+    let kids: Vec<Node> = p
+        .children()
+        .filter(|c| !c.is_text() || c.text().is_some_and(|t| !t.trim().is_empty()))
+        .collect();
+    matches!(kids.as_slice(), [c] if c.has_tag_name("code") && has_class(*c, "math-display"))
+}
+
 impl Converter {
     /// Emits an anchor macro.
     fn anchor(&mut self, name: &str) {
+        self.emitted.insert(name.to_string());
         let _ = write!(
             self.out,
             "<ac:structured-macro ac:name=\"anchor\" ac:schema-version=\"1\"><ac:parameter ac:name=\"\">{}</ac:parameter></ac:structured-macro>",
@@ -516,6 +650,84 @@ impl Converter {
     fn blocks(&mut self, node: Node) {
         for child in node.children() {
             self.node(child);
+        }
+    }
+
+    /// Runs `f` in phrasing context (see [`Converter::in_phrasing`]).
+    fn phrasing(&mut self, f: impl FnOnce(&mut Converter)) {
+        let was = std::mem::replace(&mut self.in_phrasing, true);
+        f(self);
+        self.in_phrasing = was;
+    }
+
+    /// The content of a block container. Only inline content: one
+    /// `open`...`close` paragraph. With block children: each run of inline
+    /// content becomes such a paragraph and the blocks are kept as they
+    /// are (a `<p>` child gets `p_style`), so no `<p>` ever holds a block
+    /// and no text is left outside a block. `anchor` goes into the first
+    /// paragraph, or before the first block.
+    fn container(
+        &mut self,
+        n: Node,
+        anchor: Option<&str>,
+        open: &str,
+        close: &str,
+        p_style: Option<&str>,
+    ) {
+        if self.in_phrasing {
+            if let Some(a) = anchor {
+                self.anchor(a);
+            }
+            self.blocks(n);
+            return;
+        }
+        let children: Vec<Node> = n.children().collect();
+        let mut pending = anchor;
+        let mut run: Vec<Node> = Vec::new();
+        let flush = |me: &mut Converter, run: &mut Vec<Node>, pending: &mut Option<&str>| {
+            if has_content(run) {
+                me.out.push_str(open);
+                if let Some(a) = pending.take() {
+                    me.anchor(a);
+                }
+                me.phrasing(|me| {
+                    for c in run.iter() {
+                        me.node(*c);
+                    }
+                });
+                me.out.push_str(close);
+            } else {
+                // Whitespace between blocks is kept as it is.
+                for c in run.iter().filter(|c| c.is_text()) {
+                    me.out.push_str(&esc(c.text().unwrap_or("")));
+                }
+            }
+            run.clear();
+        };
+        for c in children {
+            if !is_block(c) {
+                run.push(c);
+                continue;
+            }
+            flush(self, &mut run, &mut pending);
+            if let Some(a) = pending.take() {
+                self.anchor(a);
+            }
+            match p_style {
+                Some(style) if c.has_tag_name("p") => {
+                    let _ = write!(self.out, "<p style=\"{style}\">");
+                    if let Some(id) = c.attribute("id").filter(|i| !i.is_empty()) {
+                        self.anchor(id);
+                    }
+                    self.phrasing(|me| me.blocks(c));
+                    self.out.push_str("</p>");
+                }
+                _ => self.node(c),
+            }
+        }
+        flush(self, &mut run, &mut pending);
+        if let Some(a) = pending {
+            self.anchor(a);
         }
     }
 
@@ -566,15 +778,21 @@ impl Converter {
             }
         };
         match tag {
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                open_with_anchor(self, &format!("<{tag}>"));
+            "p" if !self.in_phrasing && only_display_math(n) => {
+                if let Some(id) = id {
+                    self.anchor(id);
+                }
                 self.blocks(n);
+            }
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "p" => {
+                open_with_anchor(self, &format!("<{tag}>"));
+                self.phrasing(|me| me.blocks(n));
                 let _ = write!(self.out, "</{tag}>");
             }
-            "p" | "blockquote" => {
-                open_with_anchor(self, &format!("<{tag}>"));
-                self.blocks(n);
-                let _ = write!(self.out, "</{tag}>");
+            "blockquote" => {
+                self.out.push_str("<blockquote>");
+                self.container(n, id, "<p>", "</p>", None);
+                self.out.push_str("</blockquote>");
             }
             "ul" if is_task_list(n) => self.task_list(n),
             "ul" | "menu" => {
@@ -597,21 +815,15 @@ impl Converter {
                 self.blocks(n);
                 self.out.push_str("</li>");
             }
-            "dt" => {
-                open_with_anchor(self, "<p><strong>");
-                self.blocks(n);
-                self.out.push_str("</strong></p>");
-            }
-            "dd" => {
-                open_with_anchor(self, "<p style=\"margin-left: 30.0px;\">");
-                self.blocks(n);
-                self.out.push_str("</p>");
-            }
-            "figcaption" => {
-                self.out.push_str("<p><em>");
-                self.blocks(n);
-                self.out.push_str("</em></p>");
-            }
+            "dt" => self.container(n, id, "<p><strong>", "</strong></p>", None),
+            "dd" => self.container(
+                n,
+                id,
+                "<p style=\"margin-left: 30.0px;\">",
+                "</p>",
+                Some("margin-left: 30.0px;"),
+            ),
+            "figcaption" => self.container(n, None, "<p><em>", "</em></p>", None),
             "hr" => self.out.push_str("<hr />"),
             "br" => self.out.push_str("<br />"),
             "strong" | "b" => self.wrap(n, "strong"),
@@ -619,11 +831,13 @@ impl Converter {
             "u" | "ins" => self.wrap(n, "u"),
             "sub" => self.wrap(n, "sub"),
             "sup" => self.wrap(n, "sup"),
+            // A display formula left as TeX (`--math off`) keeps its lines.
+            "code" if has_class(n, "math-display") => self.code_macro("none", &code_text(n)),
             "code" | "kbd" | "samp" | "tt" => self.wrap(n, "code"),
             "del" | "s" | "strike" => {
                 self.out
                     .push_str("<span style=\"text-decoration: line-through;\">");
-                self.blocks(n);
+                self.phrasing(|me| me.blocks(n));
                 self.out.push_str("</span>");
             }
             "pre" => self.code_block(n),
@@ -641,23 +855,35 @@ impl Converter {
                     self.out.push_str(mark);
                 }
             }
-            "section" if has_class(n, "footnotes") || n.has_attribute("data-footnotes") => {
-                self.footnote_section(n)
-            }
-            // Layout-only and unknown elements (div, section, span, abbr,
-            // figure, ...): the tag is dropped and the content kept.
+            _ if is_footnote_section(n) => self.footnote_section(n),
+            // Layout containers (div, section, figure, center, ...): the
+            // tag is dropped; inline content goes into paragraphs.
+            _ if CONTAINERS.contains(&tag) => self.container(n, None, "<p>", "</p>", None),
+            // Unknown inline elements (span, abbr, ...): the tag is
+            // dropped and the content kept.
             _ => self.blocks(n),
         }
     }
 
     fn wrap(&mut self, n: Node, tag: &str) {
         let _ = write!(self.out, "<{tag}>");
-        self.blocks(n);
+        self.phrasing(|me| me.blocks(n));
         let _ = write!(self.out, "</{tag}>");
     }
 
+    /// The code macro with `text` as its body.
+    fn code_macro(&mut self, lang: &str, text: &str) {
+        let _ = write!(
+            self.out,
+            "<ac:structured-macro ac:name=\"code\" ac:schema-version=\"1\"><ac:parameter ac:name=\"language\">{lang}</ac:parameter><ac:plain-text-body>{}</ac:plain-text-body></ac:structured-macro>",
+            cdata(text)
+        );
+    }
+
     /// Content of an `<ac:link-body>`: only b, strong, em, i, code, tt,
-    /// sub, sup, br and span are allowed there.
+    /// sub, sup, br and span are allowed there, plus an image
+    /// (`<ac:image>`), as in the storage format's "link with an embedded
+    /// image" example.
     fn link_body_element(&mut self, n: Node, tag: &str) {
         let mapped = match tag {
             "strong" | "b" => Some("strong"),
@@ -669,10 +895,7 @@ impl Converter {
         };
         match (tag, mapped) {
             ("br", _) => self.out.push_str("<br />"),
-            ("img", _) => {
-                let alt = n.attribute("alt").unwrap_or("").trim();
-                self.out.push_str(&esc(alt));
-            }
+            ("img", _) => self.image(n),
             (_, Some(t)) => self.wrap(n, t),
             _ => self.blocks(n),
         }
@@ -764,7 +987,7 @@ impl Converter {
         }
         if is_remote(&href) || has_scheme(&href, &["mailto:", "tel:", "ftp://", "ftps://"]) {
             let _ = write!(self.out, "<a href=\"{}\">", esc(&href));
-            self.blocks(n);
+            self.phrasing(|me| me.blocks(n));
             self.out.push_str("</a>");
             return;
         }
@@ -782,8 +1005,23 @@ impl Converter {
         match self.anchor_for(&href) {
             Some(anchor) => {
                 let _ = write!(self.out, "<ac:link ac:anchor=\"{}\">", esc(&anchor));
-                self.link_body(n);
+                let number = self
+                    .footnote_numbers
+                    .get(&anchor)
+                    .filter(|_| is_footnote_ref(n));
+                match number {
+                    // The footnote's number on the merged page.
+                    Some(num) => {
+                        let _ = write!(
+                            self.out,
+                            "<ac:plain-text-link-body>{}</ac:plain-text-link-body>",
+                            cdata(&num.to_string())
+                        );
+                    }
+                    None => self.link_body(n),
+                }
                 self.out.push_str("</ac:link>");
+                self.linked.insert(anchor);
             }
             // Anything else (an unresolved local file) keeps only its text.
             None => self.blocks(n),
@@ -818,19 +1056,14 @@ impl Converter {
             .and_then(language_class)
             .or_else(|| language_class(pre))
             .unwrap_or_default();
-        let mut text = text_of(pre);
+        let mut text = code_text(pre);
         if text.ends_with('\n') {
             text.pop();
             if text.ends_with('\r') {
                 text.pop();
             }
         }
-        let _ = write!(
-            self.out,
-            "<ac:structured-macro ac:name=\"code\" ac:schema-version=\"1\"><ac:parameter ac:name=\"language\">{}</ac:parameter><ac:plain-text-body>{}</ac:plain-text-body></ac:structured-macro>",
-            code_language(&lang),
-            cdata(&text)
-        );
+        self.code_macro(code_language(&lang), &text);
     }
 
     fn task_list(&mut self, ul: Node) {
@@ -882,22 +1115,43 @@ impl Converter {
     fn table(&mut self, t: Node) {
         let caption = t.children().find(|c| c.has_tag_name("caption"));
         if let Some(c) = caption {
-            self.out.push_str("<p><strong>");
-            self.blocks(c);
-            self.out.push_str("</strong></p>");
+            let id = c.attribute("id").filter(|i| !i.is_empty());
+            self.container(c, id, "<p><strong>", "</strong></p>", None);
         }
         self.out.push_str("<table><tbody>");
-        let mut rows = Vec::new();
+        // Rows, each with the ids of its row group (first row only) and
+        // its own id: they become anchors in the row's first cell.
+        let mut rows: Vec<(Node, Vec<&str>)> = Vec::new();
+        fn id_of<'a>(n: Node<'a, '_>) -> Option<&'a str> {
+            n.attribute("id").filter(|i| !i.is_empty())
+        }
         for c in t.children().filter(Node::is_element) {
             match c.tag_name().name() {
-                "tr" => rows.push(c),
+                "tr" => rows.push((c, id_of(c).into_iter().collect())),
                 "thead" | "tbody" | "tfoot" => {
-                    rows.extend(c.children().filter(|r| r.has_tag_name("tr")))
+                    let mut group = id_of(c);
+                    for r in c.children().filter(|r| r.has_tag_name("tr")) {
+                        let ids = group.take().into_iter().chain(id_of(r)).collect();
+                        rows.push((r, ids));
+                    }
+                    if let Some(g) = group {
+                        // A group without rows: its anchor goes to the next row.
+                        rows.push((c, vec![g]));
+                    }
                 }
                 _ => {}
             }
         }
-        for row in rows {
+        let mut pending: Vec<&str> = Vec::new();
+        for (row, ids) in rows {
+            pending.extend(ids);
+            if !row.has_tag_name("tr")
+                || !row
+                    .children()
+                    .any(|c| c.has_tag_name("td") || c.has_tag_name("th"))
+            {
+                continue;
+            }
             self.out.push_str("<tr>");
             for cell in row.children().filter(Node::is_element) {
                 let tag = match cell.tag_name().name() {
@@ -915,6 +1169,9 @@ impl Converter {
                     let _ = write!(self.out, " style=\"text-align: {align};\"");
                 }
                 self.out.push('>');
+                for id in pending.drain(..) {
+                    self.anchor(id);
+                }
                 if let Some(id) = cell.attribute("id").filter(|i| !i.is_empty()) {
                     self.anchor(id);
                 }
@@ -924,6 +1181,9 @@ impl Converter {
             self.out.push_str("</tr>");
         }
         self.out.push_str("</tbody></table>");
+        for id in pending {
+            self.anchor(id);
+        }
     }
 
     fn details(&mut self, d: Node) {
@@ -952,17 +1212,20 @@ impl Converter {
             .push_str("</ac:rich-text-body></ac:structured-macro>");
     }
 
-    /// A footnote section: its lists go to the end of the page.
+    /// A footnote section: its items join the one footnote list at the
+    /// end of the page (numbered as in [`to_storage`]).
     fn footnote_section(&mut self, s: Node) {
         let main = std::mem::take(&mut self.out);
-        for c in s.children() {
-            if c.has_tag_name("ol") || c.has_tag_name("ul") {
-                self.node(c);
+        for list in s
+            .children()
+            .filter(|c| c.has_tag_name("ol") || c.has_tag_name("ul"))
+        {
+            for li in list.children().filter(|c| c.has_tag_name("li")) {
+                self.node(li);
             }
         }
         let notes = std::mem::replace(&mut self.out, main);
         self.footnotes.push_str(&notes);
-        self.footnotes.push('\n');
     }
 }
 
@@ -1020,6 +1283,37 @@ fn language_class(n: Node) -> Option<String> {
             .or_else(|| c.strip_prefix("lang-"))
             .map(|l| l.to_ascii_lowercase())
     })
+}
+
+/// A footnote reference link (`<sup class="footnote-ref"><a ...>`).
+fn is_footnote_ref(a: Node) -> bool {
+    a.has_attribute("data-footnote-ref")
+        || a.parent()
+            .is_some_and(|p| p.has_tag_name("sup") && has_class(p, "footnote-ref"))
+}
+
+/// The text of a code block: text nodes, `<br>` as a line break, dropped
+/// elements left out.
+fn code_text(n: Node) -> String {
+    fn walk(n: Node, out: &mut String) {
+        for c in n.children() {
+            match c.node_type() {
+                NodeType::Text => out.push_str(c.text().unwrap_or("")),
+                NodeType::Element => {
+                    let tag = c.tag_name().name().to_ascii_lowercase();
+                    if tag == "br" {
+                        out.push('\n');
+                    } else if !DROP.contains(&tag.as_str()) {
+                        walk(c, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = String::new();
+    walk(n, &mut out);
+    out
 }
 
 /// All text below `n`.
@@ -1438,5 +1732,223 @@ mod tests {
         std::fs::write(other.join("keep.txt"), b"x").unwrap();
         assert!(write_dir(&export, &other).is_err());
         assert!(other.join("keep.txt").is_file());
+    }
+
+    fn conv_warn(body: &str) -> (String, BTreeSet<String>, Vec<String>) {
+        let (xml, used, warnings) = to_storage(&[chapter("ch001.xhtml", body)], false).unwrap();
+        parse_ok(&xml);
+        (xml, used, warnings)
+    }
+
+    /// Fails when a `<p>` holds a block element or another `<p>`.
+    fn assert_no_block_in_p(xml: &str) {
+        let wrapped = format!("<root xmlns:ac=\"{AC_NS}\" xmlns:ri=\"{RI_NS}\">{xml}</root>");
+        let doc = roxmltree::Document::parse(&wrapped).unwrap();
+        for p in doc.descendants().filter(|n| n.has_tag_name("p")) {
+            for d in p.descendants().skip(1).filter(Node::is_element) {
+                assert!(
+                    !BLOCK_TAGS.contains(&d.tag_name().name()),
+                    "<{}> inside <p>: {xml}",
+                    d.tag_name().name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn images_inside_in_page_links_stay_images_and_attachments() {
+        let chapters = [
+            chapter(
+                "ch001.xhtml",
+                "<p id=\"here\"><a href=\"#here\"><img src=\"../images/aa.png\" alt=\"p2\"/></a> <a href=\"ch002.xhtml\"><img src=\"../images/bb.png\" alt=\"photo\"/></a></p>",
+            ),
+            chapter("ch002.xhtml", "<h1 id=\"b-doc\">B</h1>"),
+        ];
+        let (x, used, warnings) = to_storage(&chapters, false).unwrap();
+        parse_ok(&x);
+        assert!(x.contains("<ac:link ac:anchor=\"here\"><ac:link-body><ac:image ac:alt=\"p2\"><ri:attachment ri:filename=\"aa.png\" /></ac:image></ac:link-body></ac:link>"), "{x}");
+        assert!(x.contains("<ac:link ac:anchor=\"b-doc\"><ac:link-body><ac:image ac:alt=\"photo\"><ri:attachment ri:filename=\"bb.png\" /></ac:image></ac:link-body></ac:link>"), "{x}");
+        assert!(
+            used.contains("aa.png") && used.contains("bb.png"),
+            "{used:?}"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn definition_and_caption_blocks_are_not_nested_in_paragraphs() {
+        let (x, _) = conv(
+            "<dl><dt id=\"t\">Term</dt><dd id=\"d\"><p>First para</p><p>Second</p></dd><dd>Def <ul><li>x</li></ul></dd></dl><figure><img src=\"../images/f.png\" alt=\"F\"/><figcaption><p>Caption para</p></figcaption></figure><table><caption><p>Cap</p></caption><tr><td>c</td></tr></table><dl><dt>Plain</dt><dd>Inline <em>only</em></dd></dl>",
+        );
+        assert_no_block_in_p(&x);
+        let a = |id: &str| {
+            format!(
+                "<ac:structured-macro ac:name=\"anchor\" ac:schema-version=\"1\"><ac:parameter ac:name=\"\">{id}</ac:parameter></ac:structured-macro>"
+            )
+        };
+        assert!(
+            x.contains(&format!("<p><strong>{}Term</strong></p>", a("t"))),
+            "{x}"
+        );
+        assert!(x.contains(&format!("{}<p style=\"margin-left: 30.0px;\">First para</p><p style=\"margin-left: 30.0px;\">Second</p>", a("d"))), "{x}");
+        assert!(
+            x.contains("<p style=\"margin-left: 30.0px;\">Def </p><ul><li>x</li></ul>"),
+            "{x}"
+        );
+        assert!(x.contains("<p>Caption para</p>"), "{x}");
+        assert!(x.contains("<p>Cap</p><table>"), "{x}");
+        // Inline-only content keeps its single styled paragraph.
+        assert!(x.contains("<p><strong>Plain</strong></p><p style=\"margin-left: 30.0px;\">Inline <em>only</em></p>"), "{x}");
+    }
+
+    #[test]
+    fn layout_containers_keep_text_in_separate_paragraphs() {
+        let (x, _) = conv(
+            "<div>one</div><div>two</div><center>centered</center><section><h2 id=\"s\">S</h2>para text in section</section><div><span>a</span><p>b</p>c</div><p>in <span><div>inline div</div></span></p>",
+        );
+        assert_no_block_in_p(&x);
+        assert!(x.contains("<p>one</p><p>two</p><p>centered</p>"), "{x}");
+        assert!(x.contains("S</h2><p>para text in section</p>"), "{x}");
+        assert!(x.contains("<p>a</p><p>b</p><p>c</p>"), "{x}");
+        assert!(x.contains("<p>in inline div</p>"), "{x}");
+        // Bare text at the top of an HTML body is a paragraph too.
+        let (x, _) = conv("loose <em>text</em><h2>H</h2>");
+        assert!(x.starts_with("<p>loose <em>text</em></p><h2>"), "{x}");
+    }
+
+    #[test]
+    fn footnotes_of_merged_documents_form_one_numbered_list() {
+        let note = |id: &str, n: &str| {
+            format!(
+                "<p>Text.<sup class=\"footnote-ref\"><a href=\"#fn-{id}\" id=\"fnref-{id}\" data-footnote-ref=\"\">{n}</a></sup></p><section class=\"footnotes\" data-footnotes=\"\"><ol><li id=\"fn-{id}\"><p>Note {id}. <a href=\"#fnref-{id}\" class=\"footnote-backref\">\u{21A9}</a></p></li></ol></section>"
+            )
+        };
+        let chapters = [
+            chapter("ch001.xhtml", &note("1", "1")),
+            chapter("ch002.xhtml", &note("1-2", "1")),
+        ];
+        let (x, _, warnings) = to_storage(&chapters, false).unwrap();
+        parse_ok(&x);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            x.contains("<ac:link ac:anchor=\"fn-1\"><ac:plain-text-link-body><![CDATA[1]]>"),
+            "{x}"
+        );
+        assert!(
+            x.contains("<ac:link ac:anchor=\"fn-1-2\"><ac:plain-text-link-body><![CDATA[2]]>"),
+            "{x}"
+        );
+        let notes = &x[x.find("<h2>Footnotes</h2>").unwrap()..];
+        assert_eq!(notes.matches("<ol>").count(), 1, "{x}");
+        assert_eq!(notes.matches("<li>").count(), 2, "{x}");
+        assert!(notes.find("Note 1.").unwrap() < notes.find("Note 1-2.").unwrap());
+    }
+
+    #[test]
+    fn ids_of_table_rows_and_groups_become_anchors() {
+        let (x, _, warnings) = conv_warn(
+            "<table><caption id=\"cap\">C</caption><thead id=\"head\"><tr id=\"hr\"><th>h</th></tr></thead><tbody id=\"body\"><tr id=\"row1\"><td>r</td></tr><tr id=\"empty\"></tr><tr><td id=\"cell\">s</td></tr></tbody><tfoot id=\"foot\"></tfoot></table><p><a href=\"#row1\">to row</a> <a href=\"#cap\">c</a> <a href=\"#head\">h</a> <a href=\"#body\">b</a> <a href=\"#empty\">e</a> <a href=\"#foot\">f</a> <a href=\"#cell\">x</a></p>",
+        );
+        for id in ["cap", "head", "hr", "body", "row1", "empty", "cell", "foot"] {
+            assert!(
+                x.contains(&format!("<ac:parameter ac:name=\"\">{id}</ac:parameter>")),
+                "{id}: {x}"
+            );
+        }
+        assert!(x.contains("<td><ac:structured-macro ac:name=\"anchor\" ac:schema-version=\"1\"><ac:parameter ac:name=\"\">body</ac:parameter></ac:structured-macro><ac:structured-macro ac:name=\"anchor\" ac:schema-version=\"1\"><ac:parameter ac:name=\"\">row1</ac:parameter>"), "{x}");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn links_to_missing_anchors_are_reported() {
+        let (_, _, warnings) =
+            conv_warn("<p id=\"there\"><a href=\"#nowhere\">x</a> <a href=\"#there\">y</a></p>");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("#nowhere"), "{warnings:?}");
+    }
+
+    #[test]
+    fn line_breaks_in_raw_pre_are_kept() {
+        let (x, _) = conv("<pre>line1<br/>line2<script>x</script><br/>line3</pre>");
+        assert!(x.contains("<![CDATA[line1\nline2\nline3]]>"), "{x}");
+    }
+
+    #[test]
+    fn display_math_without_renderer_is_a_code_macro() {
+        let tex = "\\begin{aligned}\nf(x) &amp;= 1 \\\\\n&amp;= 2\n\\end{aligned}";
+        let (x, _) = conv(&format!(
+            "<p><code class=\"math-display\">{tex}</code></p><p>inline <code class=\"math-inline\">x^2</code></p>"
+        ));
+        assert!(x.starts_with("<ac:structured-macro ac:name=\"code\" ac:schema-version=\"1\"><ac:parameter ac:name=\"language\">none</ac:parameter><ac:plain-text-body><![CDATA[\\begin{aligned}\nf(x) &= 1 \\\\\n&= 2\n\\end{aligned}]]></ac:plain-text-body></ac:structured-macro>"), "{x}");
+        assert!(x.contains("<p>inline <code>x^2</code></p>"), "{x}");
+    }
+
+    #[test]
+    fn foreign_manifest_directories_are_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let webapp = dir.path().join("webapp");
+        std::fs::create_dir_all(webapp.join("attachments")).unwrap();
+        let foreign = "{\"name\":\"my-ext\",\"manifest_version\":3}";
+        std::fs::write(webapp.join("manifest.json"), foreign).unwrap();
+        std::fs::write(webapp.join("attachments/keep.txt"), b"precious").unwrap();
+        assert!(!is_export_dir(&webapp));
+        // -o webapp puts the export inside it, as for any other directory.
+        let inputs = [PathBuf::from("t.md")];
+        let (out, _) =
+            output_dir(Some(&webapp), crate::model::OutputLocation::Cwd, &inputs).unwrap();
+        assert_eq!(out, webapp.join("t.confluence"));
+        let export = Export {
+            title: "T".into(),
+            page_xml: "<p>x</p>\n".into(),
+            attachments: vec![],
+        };
+        let err = write_dir(&export, &webapp).unwrap_err().to_string();
+        assert!(err.contains("not a Confluence export"), "{err}");
+        assert_eq!(
+            std::fs::read(webapp.join("attachments/keep.txt")).unwrap(),
+            b"precious"
+        );
+        assert_eq!(
+            std::fs::read_to_string(webapp.join("manifest.json")).unwrap(),
+            foreign
+        );
+        write_dir(&export, &out).unwrap();
+        assert!(is_export_dir(&out));
+    }
+
+    #[test]
+    fn manifest_file_names_must_be_plain() {
+        for bad in [
+            "C:secret.txt",
+            "c:",
+            "a/b",
+            "a\\b",
+            "..",
+            ".hidden",
+            "x\u{1}",
+        ] {
+            assert!(!is_plain_file_name(bad), "{bad:?}");
+        }
+        assert!(is_plain_file_name("0a1b2c3d4e5f6a7b.png"));
+        assert!(is_plain_file_name("page.xml"));
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("p.confluence");
+        let export = Export {
+            title: "T".into(),
+            page_xml: "<p>x</p>\n".into(),
+            attachments: vec![],
+        };
+        write_dir(&export, &out).unwrap();
+        let m = out.join(MANIFEST_FILE);
+        let good = std::fs::read_to_string(&m).unwrap();
+        std::fs::write(&m, good.replace("\"page.xml\"", "\"C:page.xml\"")).unwrap();
+        assert!(format!("{:#}", read_dir(&out).unwrap_err()).contains("invalid page file name"));
+        let with_att = good.replace(
+            "\"attachments\": []",
+            "\"attachments\": [{\"filename\": \"C:secret.txt\", \"sha256\": \"00\"}]",
+        );
+        assert_ne!(with_att, good);
+        std::fs::write(&m, with_att).unwrap();
+        assert!(format!("{:#}", read_dir(&out).unwrap_err()).contains("invalid file name"));
     }
 }
