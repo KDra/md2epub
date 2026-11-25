@@ -81,8 +81,8 @@ use serde_yaml::Value as Yaml;
 
 use crate::cli::{Cli, Command, Flags};
 use crate::model::{
-    Margin, MathMode, Metadata, NotesPlacement, NotesStyle, Options, OutputLocation, SvgMode,
-    parse_split_level,
+    ConfluenceTarget, Margin, MathMode, Metadata, NotesPlacement, NotesStyle, Options,
+    OutputFormat, OutputLocation, SvgMode, parse_split_level,
 };
 use crate::pipeline::InputKind;
 use crate::profile;
@@ -117,6 +117,11 @@ const TOML_KEYS: &[&str] = &[
     "output-location",
     "follow-links",
     "link-root",
+    "format",
+    "confluence-toc",
+    "confluence-url",
+    "confluence-space",
+    "confluence-parent-id",
 ];
 
 /// Keys accepted in the user config, in `md2epub config list` order.
@@ -138,7 +143,16 @@ pub const USER_KEYS: &[&str] = &[
     "css",
     "output-location",
     "follow-links",
+    "format",
+    "confluence-toc",
+    "confluence-url",
+    "confluence-space",
+    "confluence-parent-id",
 ];
+
+/// Keys that look like a place for the Confluence token, which is only
+/// ever read from the environment.
+const TOKEN_KEYS: &[&str] = &["token", "confluence-token", "confluence-pat", "password"];
 
 /// `book.toml` keys that describe one book and so make no sense as user
 /// defaults.
@@ -264,17 +278,23 @@ pub fn resolve_with(
 ) -> Result<(Options, Vec<PathBuf>)> {
     let mut flags = Layer::from_flags(&cli.flags)?;
 
-    let shortcut = cli.command.is_none() && is_toml_shortcut(&cli.inputs);
+    // `md2epub publish <inputs...>` converts like `md2epub <inputs...>`.
+    let positional: Vec<PathBuf> = match &cli.command {
+        Some(Command::Publish(args)) => cli.inputs.iter().chain(&args.inputs).cloned().collect(),
+        _ => cli.inputs.clone(),
+    };
+    let plain = matches!(cli.command, None | Some(Command::Publish(_)));
+    let shortcut = plain && is_toml_shortcut(&positional);
     let toml_path = match &cli.command {
         Some(Command::Build { config }) => Some(config.clone()),
         Some(Command::Config { .. }) => {
             bail!("`md2epub config` manages user defaults and converts nothing")
         }
-        None if shortcut => Some(cli.inputs[0].clone()),
-        None => None,
+        _ if shortcut => Some(positional[0].clone()),
+        _ => None,
     };
-    if !shortcut && !cli.inputs.is_empty() {
-        flags.inputs = Some(cli.inputs.clone());
+    if !shortcut && !positional.is_empty() {
+        flags.inputs = Some(positional);
     }
     let book = match &toml_path {
         Some(path) => Layer::from_toml_file(path)?,
@@ -446,6 +466,13 @@ struct Layer {
     follow_links: Option<bool>,
     /// `--link-root`, `link-root`.
     link_root: Option<PathBuf>,
+    /// `--format`, `format`.
+    format: Option<OutputFormat>,
+    /// `--confluence-toc`, `confluence-toc`.
+    confluence_toc: Option<bool>,
+    confluence_url: Option<String>,
+    confluence_space: Option<String>,
+    confluence_parent_id: Option<String>,
 }
 
 impl Layer {
@@ -489,6 +516,11 @@ impl Layer {
             output_location: f.output_location,
             follow_links: switch(f.follow_links, f.no_follow_links),
             link_root: f.link_root.clone(),
+            format: f.format,
+            confluence_toc: switch(f.confluence_toc, f.no_confluence_toc),
+            confluence_url: None,
+            confluence_space: None,
+            confluence_parent_id: None,
         })
     }
 
@@ -518,6 +550,12 @@ impl Layer {
         for (raw_key, value) in table {
             let key = raw_key.trim().to_ascii_lowercase().replace('_', "-");
             let ctx = || format!("key `{raw_key}`");
+            if TOKEN_KEYS.contains(&key.as_str()) {
+                bail!(
+                    "key `{raw_key}`: the Confluence token is never read from a file; \
+                     set the MD2EPUB_CONFLUENCE_TOKEN environment variable (or name another one with --token-env)"
+                );
+            }
             if source == TomlSource::User {
                 if PER_BOOK_KEYS.contains(&key.as_str()) {
                     bail!(
@@ -606,6 +644,20 @@ impl Layer {
                 "link-root" => {
                     l.link_root = Some(rel_to(base, &toml_string(value).with_context(ctx)?))
                 }
+                "format" => l.format = Some(toml_parse(value).with_context(ctx)?),
+                "confluence-toc" => l.confluence_toc = Some(toml_bool(value).with_context(ctx)?),
+                "confluence-url" => {
+                    let url = toml_string(value).with_context(ctx)?;
+                    l.confluence_url = Some(check_confluence_url(&url).with_context(ctx)?)
+                }
+                "confluence-space" => {
+                    let space = toml_string(value).with_context(ctx)?;
+                    l.confluence_space = Some(check_space_key(&space).with_context(ctx)?)
+                }
+                "confluence-parent-id" => {
+                    let id = toml_scalar(value).with_context(ctx)?;
+                    l.confluence_parent_id = Some(check_content_id(&id).with_context(ctx)?)
+                }
                 _ => bail!(
                     "unknown key `{raw_key}`: expected one of {}",
                     TOML_KEYS.join(", ")
@@ -690,6 +742,11 @@ impl Layer {
             output_location: self.output_location.or(lower.output_location),
             follow_links: self.follow_links.or(lower.follow_links),
             link_root: self.link_root.or(lower.link_root),
+            format: self.format.or(lower.format),
+            confluence_toc: self.confluence_toc.or(lower.confluence_toc),
+            confluence_url: self.confluence_url.or(lower.confluence_url),
+            confluence_space: self.confluence_space.or(lower.confluence_space),
+            confluence_parent_id: self.confluence_parent_id.or(lower.confluence_parent_id),
         }
     }
 
@@ -732,6 +789,13 @@ impl Layer {
             lang_given,
             follow_links: self.follow_links.unwrap_or(d.follow_links),
             link_root: self.link_root,
+            format: self.format.unwrap_or(d.format),
+            confluence_toc: self.confluence_toc.unwrap_or(d.confluence_toc),
+            confluence: ConfluenceTarget {
+                url: self.confluence_url,
+                space: self.confluence_space,
+                parent_id: self.confluence_parent_id,
+            },
         })
     }
 }
@@ -918,6 +982,54 @@ pub fn normalize_date(raw: &str) -> Option<String> {
         out.push_str(t);
     }
     Some(out)
+}
+
+/// Checks a Confluence base URL (`http(s)://host[:port][/context]`) and
+/// returns it without a trailing `/`.
+pub fn check_confluence_url(url: &str) -> Result<String> {
+    let url = url.trim();
+    let lower = url.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"));
+    match rest {
+        Some(r) if !r.is_empty() && !r.starts_with('/') => {}
+        _ => bail!(
+            "invalid Confluence URL '{url}': expected http(s)://host, with the context path if any (e.g. https://wiki.example.com/confluence)"
+        ),
+    }
+    if url.contains(['?', '#', ' ']) || url.contains('@') {
+        bail!(
+            "invalid Confluence URL '{url}': give only the base URL, without query, fragment or user name"
+        );
+    }
+    let url = url.trim_end_matches('/');
+    Ok(url.strip_suffix("/rest/api").unwrap_or(url).to_string())
+}
+
+/// Checks a Confluence space key (letters, digits, `~` for personal spaces).
+pub fn check_space_key(key: &str) -> Result<String> {
+    let key = key.trim();
+    if key.is_empty()
+        || key.len() > 255
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '~' || c == '_' || c == '-' || c == '.')
+    {
+        bail!(
+            "invalid space key '{key}': expected letters and digits such as DOCS (or ~user for a personal space)"
+        );
+    }
+    Ok(key.to_string())
+}
+
+/// Checks a Confluence content id (digits).
+pub fn check_content_id(id: &str) -> Result<String> {
+    let id = id.trim();
+    if id.is_empty() || id.len() > 20 || !id.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("invalid page id '{id}': expected the numeric id of a page (pageId=... in its URL)");
+    }
+    Ok(id.to_string())
 }
 
 fn check_line_spacing(v: f32) -> Result<()> {
@@ -1836,5 +1948,67 @@ mod tests {
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(err.contains("`margin`"), "{err}");
         assert!(err.contains("md2epub config"), "{err}");
+    }
+
+    #[test]
+    fn format_and_confluence_settings() {
+        // Flags over book.toml over the user config.
+        let u = user(
+            "format = \"confluence\"\nconfluence-url = \"https://w.example/c/\"\nconfluence-space = \"DOCS\"\nconfluence-parent-id = 42\nconfluence-toc = true\n",
+        );
+        let o = defaults(&u).unwrap();
+        assert_eq!(o.format, OutputFormat::Confluence);
+        assert!(o.confluence_toc);
+        assert_eq!(o.confluence.url.as_deref(), Some("https://w.example/c"));
+        assert_eq!(o.confluence.space.as_deref(), Some("DOCS"));
+        assert_eq!(o.confluence.parent_id.as_deref(), Some("42"));
+        let (o, _) = resolve_with(
+            &cli(&[
+                &path_str(&fixture("kitchen-sink.md")),
+                "--format",
+                "epub",
+                "--no-confluence-toc",
+            ]),
+            None,
+            &u,
+        )
+        .unwrap();
+        assert_eq!(o.format, OutputFormat::Epub);
+        assert!(!o.confluence_toc);
+        let book = Layer::from_toml_str(
+            "format = \"confluence\"\nconfluence-space = \"~ada\"",
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(book.format, Some(OutputFormat::Confluence));
+        assert_eq!(book.confluence_space.as_deref(), Some("~ada"));
+        assert_eq!(Options::default().format, OutputFormat::Epub);
+        for (text, needle) in [
+            ("format = \"pdf\"", "output format"),
+            (
+                "confluence-url = \"wiki.example.com\"",
+                "invalid Confluence URL",
+            ),
+            ("confluence-space = \"a b\"", "invalid space key"),
+            ("confluence-parent-id = \"abc\"", "invalid page id"),
+            ("confluence-token = \"x\"", "never read from a file"),
+            ("token = \"x\"", "MD2EPUB_CONFLUENCE_TOKEN"),
+        ] {
+            let err = format!(
+                "{:#}",
+                UserConfig::from_toml_str(text, Path::new(".")).unwrap_err()
+            );
+            assert!(err.contains(needle), "{text}: {err}");
+            let err = format!(
+                "{:#}",
+                Layer::from_toml_str(text, Path::new(".")).unwrap_err()
+            );
+            assert!(err.contains(needle), "book.toml {text}: {err}");
+        }
+        assert_eq!(
+            check_confluence_url("https://w.example/rest/api/").unwrap(),
+            "https://w.example"
+        );
+        assert!(check_confluence_url("https://user@w.example").is_err());
     }
 }

@@ -84,7 +84,36 @@ pub fn rasterize(
     max_h: u32,
     scale: f32,
 ) -> Result<Raster> {
-    rasterize_within(svg, resources_dir, max_w, max_h, scale, RASTER_TIMEOUT)
+    rasterize_within(
+        svg,
+        resources_dir,
+        max_w,
+        max_h,
+        scale,
+        RASTER_TIMEOUT,
+        false,
+    )
+}
+
+/// Like [`rasterize`], but keeps transparency: the PNG is RGBA on a
+/// transparent canvas (used for Confluence attachments, which sit on
+/// white or dark page themes).
+pub fn rasterize_with_alpha(
+    svg: &[u8],
+    resources_dir: Option<&Path>,
+    max_w: u32,
+    max_h: u32,
+    scale: f32,
+) -> Result<Raster> {
+    rasterize_within(
+        svg,
+        resources_dir,
+        max_w,
+        max_h,
+        scale,
+        RASTER_TIMEOUT,
+        true,
+    )
 }
 
 /// [`rasterize`] with an explicit time budget. On timeout the worker thread
@@ -96,6 +125,7 @@ fn rasterize_within(
     max_h: u32,
     scale: f32,
     timeout: Duration,
+    keep_alpha: bool,
 ) -> Result<Raster> {
     let svg = svg.to_vec();
     let dir: Option<PathBuf> = resources_dir.map(Path::to_path_buf);
@@ -105,7 +135,7 @@ fn rasterize_within(
         .stack_size(64 * 1024 * 1024)
         .spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
-                rasterize_now(&svg, dir.as_deref(), max_w, max_h, scale)
+                rasterize_now(&svg, dir.as_deref(), max_w, max_h, scale, keep_alpha)
             }))
             .unwrap_or_else(|_| Err(anyhow!("SVG renderer failed on this document")));
             let _ = tx.send(result);
@@ -129,6 +159,7 @@ fn rasterize_now(
     max_w: u32,
     max_h: u32,
     scale: f32,
+    keep_alpha: bool,
 ) -> Result<Raster> {
     let opts = options(resources_dir, Some(font_db()));
     let svg = clamp_turbulence(svg);
@@ -154,12 +185,24 @@ fn rasterize_now(
 
     let mut pixmap = tiny_skia::Pixmap::new(pw, ph)
         .ok_or_else(|| anyhow!("cannot allocate a {pw}×{ph} canvas"))?;
-    pixmap.fill(tiny_skia::Color::WHITE);
+    if !keep_alpha {
+        pixmap.fill(tiny_skia::Color::WHITE);
+    }
     let transform = tiny_skia::Transform::from_scale(pw as f32 / nw, ph as f32 / nh);
     catch_unwind(AssertUnwindSafe(|| {
         resvg::render(&tree, transform, &mut pixmap.as_mut())
     }))
     .map_err(|_| anyhow!("SVG renderer failed on this document"))?;
+    if keep_alpha {
+        let png = pixmap
+            .encode_png()
+            .map_err(|e| anyhow!("encoding rasterized SVG as PNG: {e}"))?;
+        return Ok(Raster {
+            png,
+            width: pw,
+            height: ph,
+        });
+    }
 
     // The canvas is opaque white underneath, so every pixel is fully opaque
     // and premultiplied RGB equals straight RGB: just drop the alpha byte.
@@ -755,7 +798,15 @@ mod tests {
     #[test]
     fn rasterizing_has_a_time_budget() {
         let (svg, dir) = fixture("diagram.svg");
-        let err = rasterize_within(&svg, Some(&dir), 4000, 4000, 4.0, Duration::from_nanos(1));
+        let err = rasterize_within(
+            &svg,
+            Some(&dir),
+            4000,
+            4000,
+            4.0,
+            Duration::from_nanos(1),
+            false,
+        );
         if let Err(e) = err {
             assert!(e.to_string().contains("abandoned"), "{e}");
         }

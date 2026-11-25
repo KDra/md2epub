@@ -33,7 +33,7 @@ comrak = { version = "1.2.0", default-features = false }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 # T3
 # T4
-ureq = { version = "3.5.2", default-features = false, features = ["rustls", "gzip"] }
+ureq = { version = "3.5.2", default-features = false, features = ["rustls", "gzip", "platform-verifier"] }
 base64 = "0.23.1"
 percent-encoding = "2.3.2"
 flate2 = "1.1.11"
@@ -57,11 +57,13 @@ zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
 # User defaults (`md2epub config`): config dir lookup and comment-preserving edits.
 dirs = "7.0.0"
 toml_edit = "0.25.20"
+# Confluence export and publish (`--format confluence`, `md2epub publish`).
+roxmltree = "0.21.2"
+serde_json = "1.0.154"
 
 [dev-dependencies]
 # T0
 tempfile = "3.27.0"
-roxmltree = "0.21.2"
 # T1
 # T2
 # T3

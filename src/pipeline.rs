@@ -23,8 +23,8 @@ use crate::cli::Cli;
 use crate::config::UserConfig;
 use crate::ctx::Ctx;
 use crate::markdown::{self, Rendered};
-use crate::model::{Book, Chapter, Heading, Options, OutputLocation};
-use crate::{assets, config, dom, epub, html, linked, math, mermaid, notes, style};
+use crate::model::{Book, Chapter, Heading, Options, OutputFormat, OutputLocation};
+use crate::{assets, config, confluence, dom, epub, html, linked, math, mermaid, notes, style};
 
 /// Stack size of the conversion thread. The DOM stages walk the tree
 /// recursively, so deeply nested input needs more than the default stack.
@@ -75,6 +75,8 @@ pub struct Report {
     /// Informational notes for the user (not warnings), such as `.epub`
     /// having been added to the output name.
     pub notices: Vec<String>,
+    /// For `--format confluence`: the number of attachments written.
+    pub attachments: Option<usize>,
 }
 
 /// Runs the whole conversion for a parsed command line, on a thread with a
@@ -83,10 +85,18 @@ pub struct Report {
 pub fn run(cli: &Cli, user: &UserConfig) -> Result<Report> {
     let cli = cli.clone();
     let user = user.clone();
+    on_big_stack(move || run_on_this_thread(&cli, &user))
+}
+
+/// Runs `f` on a thread with a large stack (see [`PIPELINE_STACK`]),
+/// turning a panic into an error.
+pub fn on_big_stack<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
     let handle = std::thread::Builder::new()
         .name("md2epub".into())
         .stack_size(PIPELINE_STACK)
-        .spawn(move || run_on_this_thread(&cli, &user))
+        .spawn(f)
         .context("starting the conversion thread")?;
     match handle.join() {
         Ok(result) => result,
@@ -103,18 +113,22 @@ pub fn run(cli: &Cli, user: &UserConfig) -> Result<Report> {
 
 /// Runs the whole conversion on the calling thread.
 pub fn run_on_this_thread(cli: &Cli, user: &UserConfig) -> Result<Report> {
-    // First pass learns the inputs; the second applies the front matter of
-    // the first Markdown input.
-    let (_, inputs) = config::resolve_with(cli, None, user)?;
-    let first = inputs.first().context("no input files")?;
-    let mut first_rendered = None;
-    if InputKind::of(first)? == InputKind::Markdown {
-        first_rendered = Some(markdown::render(&read_input(first)?.0)?);
+    let (opts, inputs, first_rendered) = resolve_run(cli, user)?;
+    if opts.format == OutputFormat::Confluence {
+        let (out, notice) =
+            confluence::output_dir(opts.output.as_deref(), opts.output_location, &inputs)?;
+        check_confluence_output(&out, &inputs)?;
+        let (export, warnings, verbose) = confluence_export_with(opts, &inputs, first_rendered)?;
+        confluence::write_dir(&export, &out)?;
+        return Ok(Report {
+            output: out,
+            chapters: 1,
+            warnings,
+            verbose,
+            notices: notice.into_iter().collect(),
+            attachments: Some(export.attachments.len()),
+        });
     }
-    let front_matter = first_rendered
-        .as_ref()
-        .and_then(|r| r.front_matter.as_deref());
-    let (opts, inputs) = config::resolve_with(cli, front_matter, user)?;
     let (out, notice) = output_path(&opts, &inputs);
     check_output(&out, &inputs, &opts)?;
     let (book, ctx) = build_book(opts, &inputs, first_rendered)?;
@@ -125,7 +139,87 @@ pub fn run_on_this_thread(cli: &Cli, user: &UserConfig) -> Result<Report> {
         warnings: ctx.warnings().to_vec(),
         verbose: ctx.opts.verbose,
         notices: notice.into_iter().collect(),
+        attachments: None,
     })
+}
+
+/// Resolves the options in two passes: the first learns the inputs, the
+/// second applies the front matter of the first Markdown input (returned
+/// already rendered).
+fn resolve_run(cli: &Cli, user: &UserConfig) -> Result<(Options, Vec<PathBuf>, Option<Rendered>)> {
+    let (_, inputs) = config::resolve_with(cli, None, user)?;
+    let first = inputs.first().context("no input files")?;
+    let mut first_rendered = None;
+    if InputKind::of(first)? == InputKind::Markdown {
+        first_rendered = Some(markdown::render(&read_input(first)?.0)?);
+    }
+    let front_matter = first_rendered
+        .as_ref()
+        .and_then(|r| r.front_matter.as_deref());
+    let (opts, inputs) = config::resolve_with(cli, front_matter, user)?;
+    Ok((opts, inputs, first_rendered))
+}
+
+/// Converts the inputs of `cli` into a Confluence page in memory (for
+/// `md2epub publish`), whatever `--format` says. Returns the page, the
+/// warnings, and the resolved options.
+pub fn confluence_export(
+    cli: &Cli,
+    user: &UserConfig,
+) -> Result<(confluence::Export, Vec<String>, Options)> {
+    let (mut opts, inputs, first_rendered) = resolve_run(cli, user)?;
+    opts.format = OutputFormat::Confluence;
+    let kept = opts.clone();
+    let (export, warnings, _) = confluence_export_with(opts, &inputs, first_rendered)?;
+    Ok((export, warnings, kept))
+}
+
+fn confluence_export_with(
+    mut opts: Options,
+    inputs: &[PathBuf],
+    first_rendered: Option<Rendered>,
+) -> Result<(confluence::Export, Vec<String>, bool)> {
+    let mut warnings = confluence::prepare_options(&mut opts);
+    let verbose = opts.verbose;
+    if verbose {
+        for w in &warnings {
+            eprintln!("warning: {w}");
+        }
+    }
+    let toc = opts.confluence_toc;
+    let (book, ctx) = build_book(opts, inputs, first_rendered)?;
+    warnings.extend(ctx.warnings().iter().cloned());
+    let (export, more) = confluence::from_book(&book, toc)?;
+    if verbose {
+        for w in &more {
+            eprintln!("warning: {w}");
+        }
+    }
+    warnings.extend(more);
+    Ok((export, warnings, verbose))
+}
+
+/// Refuses a Confluence output directory that is an input file.
+fn check_confluence_output(out: &Path, inputs: &[PathBuf]) -> Result<()> {
+    if out.is_file() {
+        bail!(
+            "output path {} is a file; with --format confluence the output is a directory",
+            out.display()
+        );
+    }
+    let out_key = normalized_output(out);
+    for p in inputs {
+        if let Ok(c) = std::fs::canonicalize(p)
+            && c.starts_with(&out_key)
+        {
+            bail!(
+                "output directory {} contains the input {}; choose another -o",
+                out.display(),
+                p.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Refuses an output path that would overwrite an input, the `--css` file

@@ -9,20 +9,26 @@ use anyhow::{Context as _, Result};
 use sha2::{Digest, Sha256};
 
 pub use crate::model::ImgRef;
-use crate::model::{Options, Resource, SvgMode, media_type_for_ext};
+use crate::model::{Options, OutputFormat, Resource, SvgMode, media_type_for_ext};
 use crate::svg;
 
 /// Default render scale for rasterized SVGs (2x nominal size, crisp at 300 ppi).
 pub const SVG_RASTER_SCALE: f32 = 2.0;
 
 /// Re-encodes a PNG as 8-bit grayscale (used for `--grayscale`).
-fn to_grayscale_png(png: &[u8]) -> Result<Vec<u8>> {
+fn to_grayscale_png(png: &[u8], keep_alpha: bool) -> Result<Vec<u8>> {
     let img = image::load_from_memory_with_format(png, image::ImageFormat::Png)
         .context("decoding rasterized SVG")?;
     let mut out = std::io::Cursor::new(Vec::new());
-    img.to_luma8()
-        .write_to(&mut out, image::ImageFormat::Png)
-        .context("encoding grayscale PNG")?;
+    if keep_alpha {
+        img.to_luma_alpha8()
+            .write_to(&mut out, image::ImageFormat::Png)
+            .context("encoding grayscale PNG")?;
+    } else {
+        img.to_luma8()
+            .write_to(&mut out, image::ImageFormat::Png)
+            .context("encoding grayscale PNG")?;
+    }
     Ok(out.into_inner())
 }
 
@@ -138,10 +144,16 @@ impl Ctx {
                     }
                     None => svg,
                 };
-                let raster = svg::rasterize(svg.as_bytes(), resources_dir, w, h, scale)
-                    .context("rasterizing SVG")?;
+                // Confluence pages may use a dark theme, so transparency is kept.
+                let keep_alpha = self.opts.format == OutputFormat::Confluence;
+                let raster = if keep_alpha {
+                    svg::rasterize_with_alpha(svg.as_bytes(), resources_dir, w, h, scale)
+                } else {
+                    svg::rasterize(svg.as_bytes(), resources_dir, w, h, scale)
+                }
+                .context("rasterizing SVG")?;
                 let png = if self.opts.grayscale {
-                    to_grayscale_png(&raster.png)?
+                    to_grayscale_png(&raster.png, keep_alpha)?
                 } else {
                     raster.png
                 };

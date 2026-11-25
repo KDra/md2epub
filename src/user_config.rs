@@ -26,7 +26,9 @@ use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::cli::ConfigAction;
 use crate::config::{self, USER_KEYS, UserConfig, canonical_key, normalize_lang};
-use crate::model::{Margin, MathMode, NotesPlacement, NotesStyle, OutputLocation, SvgMode};
+use crate::model::{
+    Margin, MathMode, NotesPlacement, NotesStyle, OutputFormat, OutputLocation, SvgMode,
+};
 use crate::profile;
 
 /// Environment variable that overrides the user config path.
@@ -44,7 +46,9 @@ const TEMPLATE: &str = "\
 #
 # Keys: profile, author, lang, split-level, notes, notes-style, notes-pages,
 # margin, line-spacing, math, svg, grayscale, offline, verbose, css,
-# output-location, follow-links.
+# output-location, follow-links, format, confluence-toc, confluence-url,
+# confluence-space, confluence-parent-id. The Confluence token is never
+# stored here: set MD2EPUB_CONFLUENCE_TOKEN in the environment.
 # `md2epub config list` shows the effective values.
 ";
 
@@ -135,6 +139,15 @@ pub fn settings(user: &UserConfig) -> Result<Vec<Setting>> {
                 .map_or_else(|| "none".into(), |p| p.display().to_string()),
             "output-location" => o.output_location.as_str().into(),
             "follow-links" => o.follow_links.to_string(),
+            "format" => o.format.as_str().into(),
+            "confluence-toc" => o.confluence_toc.to_string(),
+            "confluence-url" => o.confluence.url.clone().unwrap_or_else(|| "none".into()),
+            "confluence-space" => o.confluence.space.clone().unwrap_or_else(|| "none".into()),
+            "confluence-parent-id" => o
+                .confluence
+                .parent_id
+                .clone()
+                .unwrap_or_else(|| "none".into()),
             _ => continue,
         };
         let source = if user.is_set(key) {
@@ -160,12 +173,20 @@ pub fn help_defaults(user: &UserConfig) -> Vec<(&'static str, String)> {
         .iter()
         .find(|s| s.key == "output-location")
         .map_or("cwd", |s| s.value.as_str());
+    let ext = if settings
+        .iter()
+        .any(|s| s.key == "format" && s.value == "confluence")
+    {
+        "confluence/"
+    } else {
+        "epub"
+    };
     out.push((
         "output",
         if output_location == "input" {
-            "<first input>.epub beside the first input".into()
+            format!("<first input>.{ext} beside the first input")
         } else {
-            "<first input>.epub in the current directory".into()
+            format!("<first input>.{ext} in the current directory")
         },
     ));
     out.push((
@@ -186,12 +207,17 @@ pub fn help_defaults(user: &UserConfig) -> Vec<(&'static str, String)> {
             "line-spacing" => "line_spacing",
             "output-location" => "output_location",
             "follow-links" => "follow_links",
+            "confluence-toc" => "confluence_toc",
+            "confluence-url" => "url",
+            "confluence-space" => "space",
+            "confluence-parent-id" => "parent_id",
             other => other,
         };
         let value = match s.value.as_str() {
             "true" => "on".to_string(),
             "false" => "off".to_string(),
             _ if s.key == "lang" => format!("the first HTML input's <html lang>, else {}", s.value),
+            "none" if s.key == "confluence-parent-id" => "none (the top of the space)".into(),
             _ => s.value,
         };
         out.push((id, value));
@@ -243,7 +269,7 @@ fn list(path: &Path, out: &mut dyn Write) -> Result<()> {
         .unwrap_or(0)
         .max(5);
     for s in settings {
-        writeln!(out, "{:<16} {:<width$}  {}", s.key, s.value, s.source)?;
+        writeln!(out, "{:<20} {:<width$}  {}", s.key, s.value, s.source)?;
     }
     Ok(())
 }
@@ -263,6 +289,12 @@ fn get(path: &Path, key: &str, out: &mut dyn Write) -> Result<()> {
 /// canonical spelling.
 fn user_key(raw: &str) -> Result<&'static str> {
     let key = canonical_key(raw);
+    if ["token", "confluence-token", "confluence-pat", "password"].contains(&key.as_str()) {
+        bail!(
+            "`{raw}` cannot be saved: the Confluence token is only read from the environment \
+             (set MD2EPUB_CONFLUENCE_TOKEN, or name another variable with `md2epub publish --token-env`)"
+        );
+    }
     if let Some(k) = USER_KEYS.iter().find(|k| **k == key) {
         return Ok(k);
     }
@@ -344,7 +376,13 @@ fn typed_value(key: &str, values: &[String]) -> Result<toml_edit::Value> {
             .parse::<f64>()
             .map_err(|_| anyhow!("invalid line spacing '{v}': expected a number such as 1.5"))?
             .into(),
-        "grayscale" | "offline" | "verbose" | "follow-links" => parse_bool(v)?.into(),
+        "grayscale" | "offline" | "verbose" | "follow-links" | "confluence-toc" => {
+            parse_bool(v)?.into()
+        }
+        "format" => v.parse::<OutputFormat>()?.as_str().into(),
+        "confluence-url" => config::check_confluence_url(v)?.into(),
+        "confluence-space" => config::check_space_key(v)?.into(),
+        "confluence-parent-id" => config::check_content_id(v)?.into(),
         "css" => {
             let p = std::path::absolute(v).with_context(|| format!("invalid path '{v}'"))?;
             if !p.is_file() {

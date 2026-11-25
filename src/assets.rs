@@ -64,7 +64,7 @@ use percent_encoding::percent_decode_str;
 use crate::ctx::{Ctx, ImgRef, SVG_RASTER_SCALE, content_hash, fit_within};
 use crate::dom::{self, Handle};
 use crate::html::{SOURCES_ATTR, SRCSET_ATTR};
-use crate::model::{Resource, SvgMode, media_type_for_ext};
+use crate::model::{OutputFormat, Resource, SvgMode, media_type_for_ext};
 use crate::svg;
 
 /// Timeout for a whole remote download (connect, headers and body).
@@ -279,11 +279,39 @@ fn process_img(img: &Handle, base: &Base, ctx: &mut Ctx) {
             }
         }
     }
+    // Confluence can show a remote image by its URL (`<ri:url>`), so one
+    // that is not attached (offline, or the download failed) stays linked.
+    if ctx.opts.format == OutputFormat::Confluence
+        && let Some(url) = candidates.iter().find(|c| {
+            let l = c.to_ascii_lowercase();
+            l.starts_with("https://") || l.starts_with("http://")
+        })
+    {
+        if ctx.opts.offline {
+            ctx.info(format!(
+                "remote image linked by URL (offline): {}",
+                short(url)
+            ));
+        } else if let Some((src, e)) = &first_error {
+            ctx.warn(format!(
+                "image not attached, linked by URL instead: {} ({e:#})",
+                short(src)
+            ));
+        }
+        dom::set_attr(img, "src", url);
+        dom::set_attr(img, REMOTE_ATTR, "1");
+        ensure_alt(img);
+        return;
+    }
     if let Some((src, e)) = first_error {
         ctx.warn(format!("image not embedded: {} ({e:#})", short(&src)));
     }
     fallback(img, &alt);
 }
+
+/// Marks an `<img>` whose `src` is a remote URL that was deliberately not
+/// downloaded (Confluence output only).
+pub const REMOTE_ATTR: &str = "data-md2epub-remote";
 
 /// The URLs of a `srcset` value, largest descriptor (`w` or `x`) first.
 fn srcset_candidates(srcset: &str) -> Vec<String> {

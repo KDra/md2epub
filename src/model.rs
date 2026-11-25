@@ -80,6 +80,17 @@ pub enum OutputLocation {
     Input,
 }
 
+/// What a conversion produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    /// A reflowable EPUB 3 file.
+    #[default]
+    Epub,
+    /// A Confluence export directory (storage-format `page.xml`,
+    /// `attachments/`, `manifest.json`), see `confluence`.
+    Confluence,
+}
+
 macro_rules! str_enum {
     ($ty:ident, $what:literal, { $($variant:ident => [$($name:literal),+]),+ $(,)? }) => {
         impl $ty {
@@ -157,6 +168,11 @@ str_enum!(Margin, "margin preset", {
 str_enum!(OutputLocation, "output location", {
     Cwd => ["cwd", "current", "current-dir", "."],
     Input => ["input", "beside-input", "source"],
+});
+
+str_enum!(OutputFormat, "output format", {
+    Epub => ["epub"],
+    Confluence => ["confluence", "confluence-storage", "storage"],
 });
 
 /// Parses a `--split-level` value: `1`, `2` or `none`.
@@ -263,6 +279,25 @@ pub struct Options {
     /// Directory that linked files must be in (`--link-root`); `None` means
     /// the git work tree of the inputs, else their common directory.
     pub link_root: Option<PathBuf>,
+    /// What the conversion produces (`--format`).
+    pub format: OutputFormat,
+    /// Add a table-of-contents macro at the top of a Confluence page
+    /// (`--confluence-toc`).
+    pub confluence_toc: bool,
+    /// Where `md2epub publish` sends the page (url, space, parent).
+    pub confluence: ConfluenceTarget,
+}
+
+/// Confluence server settings that may come from the user config or
+/// `book.toml` (never the token).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfluenceTarget {
+    /// Base URL including any context path, e.g. `https://wiki.example.com/confluence`.
+    pub url: Option<String>,
+    /// Space key, e.g. `DOCS`.
+    pub space: Option<String>,
+    /// Id of the parent page new pages are created under.
+    pub parent_id: Option<String>,
 }
 
 impl Default for Options {
@@ -292,6 +327,9 @@ impl Default for Options {
             lang_given: false,
             follow_links: true,
             link_root: None,
+            format: OutputFormat::Epub,
+            confluence_toc: false,
+            confluence: ConfluenceTarget::default(),
         }
     }
 }

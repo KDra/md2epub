@@ -6,6 +6,7 @@
 pub mod assets;
 pub mod cli;
 pub mod config;
+pub mod confluence;
 pub mod ctx;
 pub mod dom;
 pub mod epub;
@@ -18,6 +19,7 @@ pub mod model;
 pub mod notes;
 pub mod pipeline;
 pub mod profile;
+pub mod publish;
 pub mod style;
 pub mod svg;
 pub mod user_config;

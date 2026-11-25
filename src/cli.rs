@@ -17,7 +17,9 @@ use clap::builder::StyledStr;
 use clap::builder::styling::Style;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
-use crate::model::{Margin, MathMode, NotesPlacement, NotesStyle, OutputLocation, SvgMode};
+use crate::model::{
+    Margin, MathMode, NotesPlacement, NotesStyle, OutputFormat, OutputLocation, SvgMode,
+};
 
 /// The clap command with `[default: ...]` appended to each listed option's
 /// help. `defaults` maps an argument id (the `Flags` field name, e.g.
@@ -34,6 +36,27 @@ pub fn command_with_defaults(
     let mut cmd = Cli::command();
     let bold = Style::new().bold();
     for (id, text) in defaults {
+        // `url`, `space` and `parent_id` belong to `md2epub publish`.
+        if ["url", "space", "parent_id"].contains(id) {
+            let text = text.clone();
+            let id = *id;
+            cmd = cmd.mut_subcommand("publish", move |sub| {
+                let Some(arg) = sub.get_arguments().find(|a| a.get_id() == id) else {
+                    return sub;
+                };
+                let base = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+                let mut s = StyledStr::new();
+                let _ = write!(
+                    s,
+                    "{} [default: {}{text}{}]",
+                    base.trim_end(),
+                    bold.render(),
+                    bold.render_reset()
+                );
+                sub.mut_arg(id, |a| a.help(s))
+            });
+            continue;
+        }
         let Some(arg) = cmd.get_arguments().find(|a| a.get_id() == id) else {
             continue;
         };
@@ -125,13 +148,82 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
+    /// Publish to Confluence Data Center / Server (converts the inputs, or uploads a --format confluence export).
+    #[command(
+        long_about = "Publish to Confluence Data Center / Server.\n\n\
+            Converts the inputs (Markdown, HTML or a book.toml) to Confluence storage format, \
+            or takes a directory written by `--format confluence`, and creates or updates one \
+            page through the REST API, uploading images, diagrams and math as attachments.\n\n\
+            The personal access token is read from the MD2EPUB_CONFLUENCE_TOKEN environment \
+            variable (or the variable named by --token-env); it is never accepted as an \
+            argument or a config key.",
+        after_help = PUBLISH_HELP
+    )]
+    Publish(PublishArgs),
+}
+
+/// Examples under `md2epub publish --help`.
+const PUBLISH_HELP: &str = "\
+Examples:
+  export MD2EPUB_CONFLUENCE_TOKEN=...   # Profile > Personal Access Tokens
+  md2epub publish notes.md --url https://wiki.example.com --space DOCS --parent-id 12345
+  md2epub publish notes.md --page-id 67890 --dry-run
+  md2epub notes.md --format confluence -o notes.confluence && md2epub publish notes.confluence
+
+url, space and parent id may be saved with `md2epub config set confluence-url ...`,
+`confluence-space` and `confluence-parent-id` (or set in book.toml).";
+
+/// Options of `md2epub publish`.
+#[derive(Debug, Clone, Args, PartialEq, Default)]
+pub struct PublishArgs {
+    /// Markdown/HTML inputs, a book.toml, or one directory written by --format confluence.
+    #[arg(required = true, value_name = "INPUTS|DIR")]
+    pub inputs: Vec<PathBuf>,
+
+    /// Confluence base URL including the context path, e.g. https://wiki.example.com/confluence.
+    #[arg(long, value_name = "URL")]
+    pub url: Option<String>,
+
+    /// Space key, e.g. DOCS.
+    #[arg(long, value_name = "KEY")]
+    pub space: Option<String>,
+
+    /// Create the page under this parent page id.
+    #[arg(long = "parent-id", value_name = "ID")]
+    pub parent_id: Option<String>,
+
+    /// Update this page id instead of looking the page up by title.
+    #[arg(long = "page-id", value_name = "ID")]
+    pub page_id: Option<String>,
+
+    /// Show what would be created, updated and uploaded; only read requests are sent.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+
+    /// Delete attachments of the page that the new version no longer uses.
+    #[arg(long = "prune-attachments")]
+    pub prune_attachments: bool,
+
+    /// Trust the CA certificates in this PEM file instead of the system store.
+    #[arg(long = "ca-cert", value_name = "FILE")]
+    pub ca_cert: Option<PathBuf>,
+
+    /// Environment variable that holds the personal access token.
+    #[arg(
+        long = "token-env",
+        value_name = "NAME",
+        default_value = "MD2EPUB_CONFLUENCE_TOKEN"
+    )]
+    pub token_env: String,
 }
 
 /// Settable keys, shown under `md2epub config --help`.
 const CONFIG_KEYS_HELP: &str = "\
 Keys: profile, author, lang, split-level, notes, notes-style, notes-pages, margin,
       line-spacing, math, svg, grayscale, offline, verbose, css, output-location,
-      follow-links (the same values as the flags of the same name)
+      follow-links, format, confluence-toc (the same values as the flags of the same
+      name), confluence-url, confluence-space, confluence-parent-id (defaults for
+      `md2epub publish`; the token is only read from the environment)
 
 Examples:
   md2epub config set profile scribe
@@ -174,7 +266,7 @@ pub enum ConfigAction {
 /// Options shared by both forms of the command.
 #[derive(Debug, Clone, Args, PartialEq, Default)]
 pub struct Flags {
-    /// Output EPUB path (a directory, or `.epub` is added when missing).
+    /// Output EPUB path (a directory, or `.epub` is added when missing); with --format confluence, the export directory.
     #[arg(short = 'o', long = "output", global = true, value_name = "FILE")]
     pub output: Option<PathBuf>,
 
@@ -282,6 +374,27 @@ pub struct Flags {
     /// Follow links only to files inside this folder; links starting with `/` resolve against it.
     #[arg(long = "link-root", global = true, value_name = "DIR")]
     pub link_root: Option<PathBuf>,
+
+    // --- Output format ---
+    /// Output format: epub, or confluence (a directory with storage-format page.xml, attachments/ and manifest.json).
+    #[arg(long, global = true, value_name = "FORMAT")]
+    pub format: Option<OutputFormat>,
+
+    /// Confluence: add a table-of-contents macro at the top of the page.
+    #[arg(
+        long = "confluence-toc",
+        global = true,
+        overrides_with = "no_confluence_toc"
+    )]
+    pub confluence_toc: bool,
+
+    /// Confluence: no table-of-contents macro (overrides `confluence-toc = true`).
+    #[arg(
+        long = "no-confluence-toc",
+        global = true,
+        overrides_with = "confluence_toc"
+    )]
+    pub no_confluence_toc: bool,
 }
 
 #[cfg(test)]

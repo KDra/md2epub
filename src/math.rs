@@ -38,7 +38,7 @@ use pulldown_latex::{Parser, RenderConfig, Storage, config::DisplayMode, push_ma
 
 use crate::ctx::Ctx;
 use crate::dom::{self, Handle};
-use crate::model::MathMode;
+use crate::model::{MathMode, OutputFormat};
 
 /// Longest one formula may take to render before it is given up.
 pub const RENDER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -47,6 +47,10 @@ pub const RENDER_TIMEOUT: Duration = Duration::from_secs(20);
 /// 26.7 px) per em, so this gives about 160 px per em: crisp at 300 ppi
 /// even when the reader enlarges the text.
 pub const MATH_RASTER_SCALE: f32 = 6.0;
+
+/// Raster scale for math on Confluence pages: two device pixels per CSS
+/// pixel at 16 px per em (the SVG has about 26.7 px per em).
+pub const CONFLUENCE_MATH_SCALE: f32 = 2.0 * FALLBACK_PX_PER_EM / 26.67;
 
 /// Longest LaTeX source accepted by the renderers (guards against runaway input).
 const MAX_LATEX_LEN: usize = 20_000;
@@ -225,7 +229,10 @@ pub fn transform(doc: &Handle, ctx: &mut Ctx) -> Result<()> {
         .filter(|s| dom::has_attr(s, "data-math-style"))
         .collect();
     // Raw MathML must go on device profiles unless MathML was asked for.
-    let convert_raw = ctx.opts.profile.flatten_alpha && ctx.opts.math != MathMode::Mathml;
+    // Confluence cannot show MathML either.
+    let convert_raw = (ctx.opts.profile.flatten_alpha
+        || ctx.opts.format == OutputFormat::Confluence)
+        && ctx.opts.math != MathMode::Mathml;
     let raw: Vec<Handle> = if convert_raw {
         dom::select_by_tag(doc, "math")
             .into_iter()
@@ -368,7 +375,13 @@ fn code_node(class: &str, latex: &str) -> Handle {
 fn image_node(latex: &str, display: bool, class: &str, ctx: &mut Ctx) -> Result<Handle> {
     let math = render_svg(latex, display)?;
     let dir = ctx.base_dir.clone();
-    let img = ctx.add_vector_scaled(&math.svg, Some(&dir), MATH_RASTER_SCALE)?;
+    let confluence = ctx.opts.format == OutputFormat::Confluence;
+    let scale = if confluence {
+        CONFLUENCE_MATH_SCALE
+    } else {
+        MATH_RASTER_SCALE
+    };
+    let img = ctx.add_vector_scaled(&math.svg, Some(&dir), scale)?;
     let style = if display {
         // Width only, so `max-width: 100%` from the stylesheet can shrink a
         // wide equation without distorting it.
@@ -390,7 +403,7 @@ fn image_node(latex: &str, display: bool, class: &str, ctx: &mut Ctx) -> Result<
         ("style", style.as_str()),
         ("data-res", "1"),
     ];
-    if !display {
+    if !display || confluence {
         attrs.push(("width", width.as_str()));
         attrs.push(("height", height.as_str()));
     }

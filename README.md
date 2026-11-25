@@ -1,7 +1,8 @@
 # md2epub
 
 Convert rich Markdown or HTML into a **reflowable EPUB 3** that you can write on with a
-**Kindle Scribe** (Active Canvas, via Send to Kindle) or a **reMarkable**.
+**Kindle Scribe** (Active Canvas, via Send to Kindle) or a **reMarkable**, or into a
+**Confluence Data Center / Server page** (see [Confluence](#confluence)).
 
 - GitHub-flavoured Markdown: tables, footnotes, task lists, strikethrough, autolinks,
   YAML front matter, and raw HTML passed through.
@@ -109,6 +110,8 @@ self-closed `<div/>`).
 | `-v, --verbose` | flag | off | Print progress and detailed diagnostics. `--no-verbose` turns it off. |
 | `--follow-links` | flag | on | Add linked local files to the book (see below). `--no-follow-links` turns it off. |
 | `--link-root <DIR>` | directory | git work tree of the inputs, else their common folder | Follow links only to files inside this folder; links that start with `/` resolve against it (see below). |
+| `--format <FORMAT>` | `epub`, `confluence` | `epub` | Write an EPUB, or a Confluence export directory (see [Confluence](#confluence)). |
+| `--confluence-toc` | flag | off | Confluence only: put a table-of-contents macro at the top of the page. `--no-confluence-toc` turns it off. |
 
 The defaults above are the built-in ones. `md2epub --help` shows the defaults that
 actually apply, in bold on a terminal, including your own (see
@@ -182,6 +185,10 @@ css = "extra.css"
 offline = true
 follow-links = true
 link-root = ".."          # optional, see "Linked local files"
+format = "epub"           # or "confluence"
+# confluence-url = "https://wiki.example.com"   # for `md2epub publish`
+# confluence-space = "DOCS"
+# confluence-parent-id = "123456"
 ```
 
 Flags given on the command line still win: `md2epub build book.toml --profile remarkable -o rm.epub`.
@@ -211,8 +218,10 @@ md2epub config                     # same as `md2epub config list`
 
 Keys: `profile`, `author`, `lang`, `split-level`, `notes`, `notes-style`, `notes-pages`,
 `margin`, `line-spacing`, `math`, `svg`, `grayscale`, `offline`, `verbose`, `css`,
-`output-location` and `follow-links`. They take the same values as the flags with the same
-names. Booleans accept `true`/`false`, `on`/`off`, `yes`/`no`. Per-book settings
+`output-location`, `follow-links`, `format` and `confluence-toc`. They take the same values
+as the flags with the same names. `confluence-url`, `confluence-space` and
+`confluence-parent-id` are the defaults of `md2epub publish --url`, `--space` and
+`--parent-id`. The Confluence token can never be saved here. Booleans accept `true`/`false`, `on`/`off`, `yes`/`no`. Per-book settings
 (`title`, `cover`, `output`, `date`, `identifier`, inputs) cannot be defaults.
 
 The file is TOML, `config.toml` in your configuration directory: `~/.config/md2epub/` on
@@ -274,6 +283,118 @@ At most 500 linked files are added. Web links, `mailto:` links and links inside 
 are not affected. Use `--no-follow-links` (or `follow-links = false` in `book.toml`, or
 `md2epub config set follow-links false` to make it your default) to only convert the
 inputs; links to other local files are then removed, with a warning.
+
+## Confluence
+
+md2epub can also turn the same inputs into a page for **Confluence Data Center or Server**
+(self-hosted), either as files you can inspect or upload yourself, or published directly
+through the REST API.
+
+### Export
+
+```sh
+md2epub guide.md --format confluence               # writes guide.confluence/
+md2epub intro.md setup.md -o docs/handbook.confluence --format confluence
+md2epub config set format confluence               # make it your default
+```
+
+The output is a directory (named like the EPUB, with `.confluence` in place of `.epub`;
+`-o book.epub` is an error under `--format confluence`):
+
+| File | Contents |
+|---|---|
+| `page.xml` | The page body in [Confluence storage format](https://confluence.atlassian.com/doc/confluence-storage-format-790796544.html), UTF-8, without a root element. |
+| `attachments/` | Every image, diagram and formula the page shows, named by content hash (`3f9a….png`). |
+| `manifest.json` | The title and, per attachment, the file name, media type, size and SHA-256. |
+
+All inputs and the local documents they link to become **one page**, in order. How the
+content maps to Confluence:
+
+| Markdown / HTML | Confluence |
+|---|---|
+| Headings, paragraphs, lists, tables (with header cells), quotes, rules, bold, italic, underline, sub/superscript, inline code | The same elements. Strikethrough becomes `text-decoration: line-through`. |
+| Images, SVG, Mermaid diagrams, LaTeX math | Attachments shown with `<ac:image>`. SVG, diagrams and math are rasterized to PNG at twice their display size, with transparency kept (so they also work on dark themes); inline math sits in the text. |
+| Remote images | Downloaded and attached; with `--offline` they are shown from their URL instead. |
+| Fenced code | The **Code Block** macro with its language (`bash`, `py`, `js`, `rust`, …; an unknown language gives `none`). No highlighting markup is kept. |
+| Links to headings and between your documents | Links to anchors on the page. md2epub adds an **Anchor** macro for every heading and element id, because Confluence's own heading anchors change when the page title or a heading changes. |
+| External links | Plain links. |
+| Footnotes | Superscript links to a **Footnotes** section at the end of the page, with links back. |
+| Task lists | Confluence tasks (complete / incomplete). |
+| `<details>` | The **Expand** macro. |
+
+The cover, note pages, margins, `--css`, device profiles and the book navigation are EPUB
+features and are left out. With `--confluence-toc` the page starts with a **Table of
+Contents** macro.
+
+### Publish
+
+```sh
+export MD2EPUB_CONFLUENCE_TOKEN=...                # your personal access token
+md2epub publish guide.md --url https://wiki.example.com --space DOCS --parent-id 123456
+md2epub publish guide.md --url https://example.com/confluence --space DOCS --dry-run
+md2epub publish guide.confluence                   # upload an export as it is
+md2epub publish book.toml --page-id 987654         # update a known page
+```
+
+| Option | Meaning |
+|---|---|
+| `--url <URL>` | Base URL of Confluence, including its context path if it has one (`https://example.com/confluence`). |
+| `--space <KEY>` | Space key. |
+| `--parent-id <ID>` | Create the page under this page (the number in `pageId=` of its URL). Without it, the page goes to the top of the space. |
+| `--title <TITLE>` | Page title (default: as for the book title: front matter, first heading, file name). |
+| `--page-id <ID>` | Update this page instead of looking for a page with the same title in the space. |
+| `--dry-run` | Print what would be created, updated, uploaded and deleted. Only read requests are sent. |
+| `--prune-attachments` | Delete attachments of the page that the new version does not use (including ones added by hand). |
+| `--ca-cert <FILE>` | Trust the CA certificates in this PEM file **instead of** the system trust store. |
+| `--token-env <NAME>` | Read the token from this environment variable (default `MD2EPUB_CONFLUENCE_TOKEN`). |
+
+`url`, `space` and `parent-id` can be saved with `md2epub config set confluence-url …`,
+`confluence-space` and `confluence-parent-id`, or set in `book.toml`. Conversion options
+(`--offline`, `--math`, `--follow-links`, `--confluence-toc`, …) work as for an export.
+
+What publish does:
+
+1. It looks for the page by `--page-id`, or by title in the space.
+2. A **new page** with attachments is first created with a one-line "Publishing…" body,
+   the attachments are uploaded, and then the real body is saved as version 2. The page
+   never shows broken images.
+3. An **existing page** first gets its new and changed attachments, then the new body as
+   the next version (if someone saved the page at the same moment, md2epub fetches the
+   new version number and tries once more), and only then are unused attachments
+   deleted (with `--prune-attachments`). Unchanged attachments (same file name, size and
+   hash) are not uploaded again.
+4. It prints the page URL.
+
+**Token.** Create a personal access token in Confluence: your avatar (top right) >
+**Profile** > **Personal Access Tokens** > **Create token**. Personal access tokens exist in
+Confluence Data Center and Server 7.9 and later. md2epub sends it as
+`Authorization: Bearer <token>` and reads it only from the environment: it is never accepted
+as an argument or a config key, and it is never printed (it is masked in error messages).
+
+**Permissions.** The token's user needs **View** and **Add** (pages) permission in the
+space, **Add** for attachments, and **Delete** for attachments to use
+`--prune-attachments`. To update a page with page restrictions, the user must be allowed
+to edit it.
+
+**Network.** HTTPS certificates are checked against the operating system's trust store,
+so a corporate CA that your system trusts works; use `--ca-cert` otherwise. Proxies are
+taken from `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` and `NO_PROXY`. Requests time out
+after 20 s without a connection and 5 minutes in total.
+
+**Limitations.**
+
+- Only Confluence **Data Center / Server** (REST API v1 and personal access tokens) is
+  supported, not Confluence Cloud.
+- Everything goes on one page; `--split-level` does not apply.
+- Math and diagrams are images: they cannot be edited in Confluence, and math does not
+  scale with the text.
+- The language names of the code macro follow Confluence's list; the newer ones (`rust`,
+  `go`, `kotlin`, `typescript`, …) need a recent Data Center release.
+- Raw HTML is reduced to what storage format supports: layout elements (`div`, `span`,
+  ...) and inline styles are dropped, their text is kept.
+- A page found by title is updated even if someone else created it; use `--dry-run` to
+  check first.
+- `--ca-cert` replaces the system trust store for that run instead of adding to it.
 
 ## Device guide
 
@@ -370,7 +491,9 @@ cargo test --no-default-features
 
 `tests/integration.rs` runs the built binary on `tests/fixtures/` under every profile. It
 checks the zip layout, XML well-formedness, that every link and image resolves, and the
-device constraints. The tests never use the network.
+device constraints. `tests/confluence.rs` checks the Confluence export and runs
+`md2epub publish` against an in-process mock of the Confluence REST API. The tests never
+use the network.
 
 Releases are built by [cargo-dist](https://opensource.axo.dev/cargo-dist/)
 (`dist-workspace.toml`, `.github/workflows/release.yml`). Pushing a tag such as `v0.1.0`

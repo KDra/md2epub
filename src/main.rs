@@ -5,6 +5,20 @@ use md2epub::cli::{Cli, Command, Flags, command_with_defaults};
 use md2epub::{pipeline, user_config};
 
 fn main() -> ExitCode {
+    // The Confluence token is never taken from the command line, where it
+    // would end up in shell history and process lists. Refuse it before
+    // clap could echo it in an error message.
+    if std::env::args_os().skip(1).any(|a| {
+        let a = a.to_string_lossy();
+        a == "--token" || a.starts_with("--token=")
+    }) {
+        eprintln!(
+            "error: the Confluence token is not accepted as an argument; set the {} \
+             environment variable (or name another variable with --token-env NAME)",
+            md2epub::publish::TOKEN_ENV
+        );
+        return ExitCode::from(2);
+    }
     // The user config is read first so that --help can show the effective
     // defaults. A broken file must not stop `config reset`/`edit`/`path`,
     // so its error is reported only when a conversion needs it.
@@ -28,6 +42,17 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(Command::Publish(args)) = &cli.command {
+        let mut stdout = std::io::stdout().lock();
+        let mut stderr = std::io::stderr();
+        return match md2epub::publish::run(&cli, args, &user, &mut stdout, &mut stderr) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match pipeline::run(&cli, &user) {
         Ok(report) => {
             for n in &report.notices {
@@ -38,12 +63,19 @@ fn main() -> ExitCode {
                     eprintln!("warning: {w}");
                 }
             }
-            eprintln!(
-                "wrote {} ({} chapters, {} warnings)",
-                report.output.display(),
-                report.chapters,
-                report.warnings.len()
-            );
+            match report.attachments {
+                Some(n) => eprintln!(
+                    "wrote {} (Confluence page, {n} attachments, {} warnings)",
+                    report.output.display(),
+                    report.warnings.len()
+                ),
+                None => eprintln!(
+                    "wrote {} ({} chapters, {} warnings)",
+                    report.output.display(),
+                    report.chapters,
+                    report.warnings.len()
+                ),
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
