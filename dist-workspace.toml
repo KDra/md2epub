@@ -15,6 +15,9 @@ targets = ["aarch64-apple-darwin", "aarch64-pc-windows-msvc", "x86_64-pc-windows
 install-path = "CARGO_HOME"
 # Where to host releases
 hosting = "github"
+# release.yml is hand-edited to use the latest actions/checkout (v7, Node 24);
+# dist 0.34 still generates v6. Keep dist from overwriting or rejecting it.
+allow-dirty = ["ci"]
 # Whether to install an updater program
 install-updater = false
 
