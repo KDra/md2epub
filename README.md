@@ -43,6 +43,31 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/KDra/md2epub/relea
 
 You can also download an archive from the Releases page and put `md2epub` on your `PATH`.
 
+### Docker (Confluence publishing)
+
+A minimal multi-arch image (linux/amd64, linux/arm64) on Docker Hub,
+[`kdrakop/md2epub`](https://hub.docker.com/r/kdrakop/md2epub), does one thing: publish
+Markdown or HTML to Confluence Data Center (its entrypoint is `md2epub publish`). It is built
+on `scratch` and holds only the static binary, CA certificates and an empty `/tmp`: no
+shell, no package manager, no other Linux tools.
+
+Mount your documents at `/work` and pass the token through the environment:
+
+```sh
+export MD2EPUB_CONFLUENCE_TOKEN=...   # Profile > Personal Access Tokens
+docker run --rm -v "$PWD:/work" -e MD2EPUB_CONFLUENCE_TOKEN \
+  kdrakop/md2epub docs/guide.md --url https://confluence.example.com --space DOCS --parent-id 12345
+```
+
+All `md2epub publish` options work (see [Confluence](#confluence)); with no arguments the
+image prints `publish --help`. Only files under the mounted directory are visible, so links
+and images outside it are skipped with a warning. Saved defaults are not used; pass
+`--url`/`--space` each time or put them in a `book.toml`. If your Confluence uses a private
+CA, mount its PEM file and pass `--ca-cert`. Mermaid's optional `mmdc` fallback is not
+included (the built-in renderer is).
+
+Build it yourself with `docker build -t md2epub .`.
+
 ### From source
 
 You need a recent stable Rust (1.92 or newer).
